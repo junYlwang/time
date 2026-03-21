@@ -1,0 +1,94 @@
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# =========================
+# Packaging
+# =========================
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# =========================
+# Virtual environments
+# =========================
+.venv/
+venv/
+env/
+ENV/
+
+# =========================
+# Jupyter
+# =========================
+.ipynb_checkpoints/
+
+# =========================
+# IDE / Editor
+# =========================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# =========================
+# OS files
+# =========================
+.DS_Store
+Thumbs.db
+
+# =========================
+# Logs
+# =========================
+*.log
+logs/
+
+# =========================
+# Runtime outputs
+# =========================
+runs/
+outputs/
+results/
+checkpoints/
+wandb/
+tensorboard/
+tb_logs/
+
+# =========================
+# Local data
+# =========================
+data/raw/
+data/processed/
+data/cache/
+*.npy
+*.npz
+*.pt
+*.pth
+*.ckpt
+
+# =========================
+# Temporary files
+# =========================
+tmp/
+temp/
+.cache/
+
+# =========================
+# Test / coverage
+# =========================
+.coverage
+.pytest_cache/
+htmlcov/
+
+# =========================
+# Environment files
+# =========================
+.env
+.env.*
