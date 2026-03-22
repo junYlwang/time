@@ -1,71 +1,82 @@
+from __future__ import annotations
+
 import torch
-import torch.nn.functional as F
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.nn import Conv1d
 from torch.nn.utils import weight_norm
 
-from .utils import init_weights, get_padding
-from .backbones import ConvNeXtBlock, UpSamplingBlock, DownSamplingBlock
+from .backbones import ConvNeXtBlock, UpSamplingBlock
+from .utils import get_padding, init_weights
 
-class Decoder(torch.nn.Module):
+
+class TimeSeriesDecoder(nn.Module):
     def __init__(self, h):
-        super(Decoder, self).__init__()
+        super().__init__()
+        self.h = h
 
-        self.h=h
-        base_dim = getattr(h, "decoder_base_dim", 128)
-        self.in_dim = base_dim * (2**len(h.up_ratio))
+        base_dim = int(getattr(h, "decoder_base_dim", 128))
+        self.up_ratio = list(getattr(h, "up_ratio", [2, 2, 2]))
+        self.in_dim = base_dim * (2 ** len(self.up_ratio))
         self.out_dim = base_dim
-        self.num_layers = getattr(h, "decoder_num_layers", [12, 8, 4])
-        self.adanorm_num_embeddings=None
-        self.layer_scale_init_value =  [1/num_layer for num_layer in self.num_layers]
-        self.output_channels = h.decoder_output_channels
+        self.num_layers = list(getattr(h, "decoder_num_layers", [12, 8, 4]))
 
-        self.latent_input_conv = weight_norm(Conv1d(h.latent_dim, h.mel_Decoder_channel//4, h.latent_input_conv_kernel_size, 1, 
-                                                padding=get_padding(h.latent_input_conv_kernel_size, 1)))
+        dec_ch = int(getattr(h, "seq_decoder_channel", 512))
 
-        self.mel_Decoder_input_conv = weight_norm(Conv1d(h.mel_Decoder_channel//4, h.mel_Decoder_channel, h.mel_Decoder_input_kernel_size, 1, 
-                                                padding=get_padding(h.mel_Decoder_input_kernel_size, 1)))
+        latent_ks = int(getattr(h, "latent_input_conv_kernel_size", 11))
+        self.latent_input_conv = weight_norm( Conv1d(int(getattr(h, "latent_dim", 32)), dec_ch // 4, latent_ks, 1, padding=get_padding(latent_ks, 1)))
 
-        self.in_mel = torch.nn.Linear(h.mel_Decoder_channel, self.in_dim)
-        self.norm_mel = nn.LayerNorm(self.in_dim, eps=1e-6)
-        self.convnext_mel = nn.ModuleList()
-        for i in range(len(self.num_layers)):
-            cur_dim = self.in_dim // (2**i)
-            cur_intermediate_dim = cur_dim * 2
-            self.convnext_mel.append(UpSamplingBlock(cur_dim, cur_dim//2, self.h.mel_Decoder_convnext_kernel_size[i], self.h.up_ratio[i],
-                                                  padding=(self.h.mel_Decoder_convnext_kernel_size[i] - self.h.up_ratio[i]) // 2))
-            for _ in range(self.num_layers[i]):
-                self.convnext_mel.append(ConvNeXtBlock(cur_dim//2, cur_intermediate_dim, self.layer_scale_init_value[i], self.adanorm_num_embeddings))
-        
-        self.final_layer_norm_mel = nn.LayerNorm(self.out_dim, eps=1e-6)
+        in_ks = int(getattr(h, "seq_decoder_input_kernel_size", 11))
+        self.decoder_input_conv = weight_norm(Conv1d(dec_ch // 4, dec_ch, in_ks, 1, padding=get_padding(in_ks, 1)))
+
+        self.in_linear = nn.Linear(dec_ch, self.in_dim)
+        self.norm = nn.LayerNorm(self.in_dim, eps=1e-6)
+
+        dec_kernels = list(getattr(h, "seq_decoder_convnext_kernel_size", [6, 6, 6]))
+
+        self.blocks = nn.ModuleList()
+        layer_scale_init = [1 / n for n in self.num_layers]
+        for i, n in enumerate(self.num_layers):
+            cur_dim = self.in_dim // (2 ** i)
+            cur_mid = cur_dim * 2
+            k = int(dec_kernels[i])
+            s = int(self.up_ratio[i])
+            self.blocks.append(
+                UpSamplingBlock(cur_dim, cur_dim // 2, k, s, padding=(k - s) // 2)
+            )
+            for _ in range(n):
+                self.blocks.append(ConvNeXtBlock(cur_dim // 2, cur_mid, layer_scale_init[i], None))
+
+        self.final_norm = nn.LayerNorm(self.out_dim, eps=1e-6)
+
+        out_ks = int(getattr(h, "seq_decoder_output_conv_kernel_size", 11))
+
+        out_channels = int(getattr(h, "output_channels", 1))
+        self.output_conv = weight_norm(
+            Conv1d(self.out_dim, out_channels, out_ks, 1, padding=get_padding(out_ks, 1))
+        )
+
+        self.output_conv.apply(init_weights)
         self.apply(self._init_weights)
-
-        self.mel_Decoder_output_conv = weight_norm(Conv1d(self.out_dim, h.decoder_output_channels, h.mel_Decoder_output_conv_kernel_size, 1, 
-                                                  padding=get_padding(h.mel_Decoder_output_conv_kernel_size, 1)))
-
-        self.mel_Decoder_output_conv.apply(init_weights)
 
     def _init_weights(self, m):
         if isinstance(m, (nn.Conv1d, nn.Linear)):
             nn.init.trunc_normal_(m.weight, std=0.02)
-            nn.init.constant_(m.bias, 0)
+            if getattr(m, "bias", None) is not None:
+                nn.init.constant_(m.bias, 0)
 
-    def forward(self, latent):
-        #input: [batch_size, latent_dim, frames//ratio]
-        latent = F.gelu(latent)
-        latent = self.latent_input_conv(latent)
-        latent = F.gelu(latent)
-        mel = self.mel_Decoder_input_conv(latent)
-        mel = F.gelu(mel)
-        mel = self.in_mel(mel.transpose(1, 2))
-        mel = self.norm_mel(mel)
-        mel = mel.transpose(1, 2)
-        for conv_block in self.convnext_mel:
-            mel = conv_block(mel)
-        mel = self.final_layer_norm_mel(mel.transpose(1, 2))
-        mel = mel.transpose(1, 2)
-        mel = self.mel_Decoder_output_conv(mel) #output: [batch_size, h.num_mels, frames]
+    def forward(self, latent: torch.Tensor) -> torch.Tensor:
+        h = F.gelu(latent)
+        h = self.latent_input_conv(h)
+        h = F.gelu(h)
+        h = self.decoder_input_conv(h)
+        h = F.gelu(h)
+        h = self.in_linear(h.transpose(1, 2))
+        h = self.norm(h).transpose(1, 2)
 
-        return mel
+        for blk in self.blocks:
+            h = blk(h)
 
-
+        h = self.final_norm(h.transpose(1, 2)).transpose(1, 2)
+        x = self.output_conv(h)
+        return x

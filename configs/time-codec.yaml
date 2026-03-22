@@ -18,7 +18,7 @@ max_eval_sequences: 512
 input_channels: 1
 output_channels: 1
 
-encoder_in_dim: 256
+encoder_in_dim: 32
 encoder_num_layers: [4, 8, 12]
 down_ratio: [2, 2, 2]
 encoder_embed_kernel_size: 11
@@ -35,7 +35,7 @@ temp_steps: 30000
 levels_1: [8, 5, 5, 5]
 levels_2: [8, 5, 5, 5]
 
-decoder_base_dim: 256
+decoder_base_dim: 32
 decoder_num_layers: [12, 8, 4]
 up_ratio: [2, 2, 2]
 latent_input_conv_kernel_size: 11
