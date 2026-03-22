@@ -1,0 +1,11 @@
+{
+  "train": [
+    "/path/to/time300b/snapshot/energy",
+    "/path/to/time300b/snapshot/finance/exchange_rate",
+    "/path/to/time300b/snapshot/sales"
+  ],
+  "valid": [
+    "/path/to/time300b/snapshot/other/m4_hourly",
+    "/path/to/time300b/snapshot/transport/traffic_hourly"
+  ]
+}

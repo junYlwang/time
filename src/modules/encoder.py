@@ -44,13 +44,13 @@ class InvertibleLayerNorm(nn.Module):
         return x * self.current_std + self.current_mean
 
 
-class TimeSeriesEncoder(nn.Module):
+class Encoder(nn.Module):
     def __init__(self, h):
         super().__init__()
         self.h = h
 
-        self.input_channels = int(getattr(h, "input_channels", getattr(h, "num_mels", 1)))
-        self.in_dim = int(getattr(h, "encoder_in_dim", 128))
+        self.input_channels = int(getattr(h, "input_channels", 1))
+        self.in_dim = int(getattr(h, "encoder_in_dim", 32))
         self.num_layers = list(getattr(h, "encoder_num_layers", [4, 8, 12]))
         self.down_ratio = list(getattr(h, "down_ratio", [2, 2, 2]))
         self.out_dim = self.in_dim * (2 ** len(self.down_ratio))
@@ -59,13 +59,8 @@ class TimeSeriesEncoder(nn.Module):
         self.embed = nn.Conv1d(self.input_channels, self.in_dim, kernel_size=embed_ks, padding=embed_ks // 2)
         self.norm = nn.LayerNorm(self.in_dim, eps=1e-6)
 
-        enc_kernels = list(
-            getattr(
-                h,
-                "seq_encoder_convnext_kernel_size",
-                getattr(h, "mel_Encoder_convnext_kernel_size", [6, 6, 6]),
-            )
-        )
+        ds_kernels = list(getattr(h, "seq_encoder_downsample_kernel_size", [6, 6, 6]))
+
         self.blocks = nn.ModuleList()
         layer_scale_init = [1 / n for n in self.num_layers]
         for i, n in enumerate(self.num_layers):
@@ -73,7 +68,7 @@ class TimeSeriesEncoder(nn.Module):
             cur_mid = cur_dim * 4
             for _ in range(n):
                 self.blocks.append(ConvNeXtBlock(cur_dim, cur_mid, layer_scale_init[i], None))
-            k = int(enc_kernels[i])
+            k = int(ds_kernels[i])
             s = int(self.down_ratio[i])
             self.blocks.append(
                 DownSamplingBlock(cur_dim, cur_dim * 2, k, s, padding=(k - s) // 2)
@@ -81,22 +76,17 @@ class TimeSeriesEncoder(nn.Module):
 
         self.final_norm = nn.LayerNorm(self.out_dim, eps=1e-6)
 
-        proj_dim = int(getattr(h, "seq_encoder_channel", getattr(h, "mel_Encoder_channel", 512)))
+        proj_dim = int(getattr(h, "seq_encoder_channel", 128))
         self.out_linear = nn.Linear(self.out_dim, proj_dim)
 
-        out_ks = int(
-            getattr(
-                h,
-                "seq_encoder_output_kernel_size",
-                getattr(h, "mel_Encoder_output_kernel_size", 11),
-            )
-        )
+        out_ks = int(getattr(h, "seq_encoder_output_kernel_size", 11))
+
         self.output_conv = weight_norm(
             Conv1d(proj_dim, proj_dim // 4, out_ks, 1, padding=get_padding(out_ks, 1))
         )
 
         latent_ks = int(getattr(h, "latent_output_conv_kernel_size", 11))
-        latent_dim = int(getattr(h, "latent_dim", 32))
+        latent_dim = int(getattr(h, "latent_dim", 16))
         self.latent_conv = weight_norm(
             Conv1d(proj_dim // 4, latent_dim, latent_ks, 1, padding=get_padding(latent_ks, 1))
         )
@@ -109,12 +99,9 @@ class TimeSeriesEncoder(nn.Module):
         self.quantizer_1 = IFSQ(levels=levels_1, dim=latent_dim, channel_first=True, stochastic=bool(getattr(h, "stochastic", False)))
         self.layernorm_1 = InvertibleLayerNorm(latent_dim)
 
-        self.quantizer_2 = None
-        self.layernorm_2 = None
-        if self.num_quantizers >= 2:
-            levels_2 = getattr(h, "levels_2", [8, 5, 5, 5])
-            self.quantizer_2 = IFSQ(levels=levels_2, dim=latent_dim, channel_first=True, stochastic=bool(getattr(h, "stochastic", False)))
-            self.layernorm_2 = InvertibleLayerNorm(latent_dim)
+        levels_2 = getattr(h, "levels_2", [8, 5, 5, 5])
+        self.quantizer_2 = IFSQ(levels=levels_2, dim=latent_dim, channel_first=True, stochastic=bool(getattr(h, "stochastic", False)))
+        self.layernorm_2 = InvertibleLayerNorm(latent_dim)
 
         self.apply(self._init_weights)
 
@@ -142,13 +129,10 @@ class TimeSeriesEncoder(nn.Module):
         z1, c1 = self.quantizer_1(self.layernorm_1(latent))
         z1 = self.layernorm_1.inverse(z1)
 
-        if self.quantizer_2 is not None:
-            z2, c2 = self.quantizer_2(self.layernorm_2(latent - z1.detach()))
-            z2 = self.layernorm_2.inverse(z2)
-            zq = z1 + z2
-            codes = torch.stack([c1, c2], dim=1)
-        else:
-            zq = z1
-            codes = c1.unsqueeze(1)
+        z2, c2 = self.quantizer_2(self.layernorm_2(latent - z1.detach()))
+        z2 = self.layernorm_2.inverse(z2)
+        
+        zq = z1 + z2
+        codes = torch.stack([c1, c2], dim=1)
 
         return zq, codes

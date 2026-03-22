@@ -10,7 +10,7 @@ from .backbones import ConvNeXtBlock, UpSamplingBlock
 from .utils import get_padding, init_weights
 
 
-class TimeSeriesDecoder(nn.Module):
+class Decoder(nn.Module):
     def __init__(self, h):
         super().__init__()
         self.h = h

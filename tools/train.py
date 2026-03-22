@@ -19,7 +19,12 @@ import torch.nn.functional as F
 import yaml
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
+from modules.encoder import Encoder as TimeSeriesEncoder
+from modules.decoder import Decoder as TimeSeriesDecoder
+from modules.utils import load_hparams, build_env, load_checkpoint, save_checkpoint, get_state_dict
+from datasets.time_codec_dataset import SplitTimeSeriesCodecDataset
 
 _THIS_DIR = os.path.dirname(__file__)
 _PROJECT_ROOT = os.path.abspath(os.path.join(_THIS_DIR, ".."))
@@ -27,11 +32,6 @@ _SRC_DIR = os.path.join(_PROJECT_ROOT, "src")
 if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
 
-from modules.time_encoder import TimeSeriesEncoder
-from modules.time_decoder import TimeSeriesDecoder
-from modules.utils import load_hparams, build_env, load_checkpoint, save_checkpoint, get_state_dict
-from datasets.time_moe_dataset import TimeMoEDataset
-from datasets.time_codec_dataset import TimeSeriesSegmentIterableDataset, TimeSeriesSegmentEvalDataset
 
 
 def set_seed(seed: int) -> None:
@@ -115,38 +115,61 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
         encoder = DDP(encoder, device_ids=ddp_ids, find_unused_parameters=ddp_unused)
         decoder = DDP(decoder, device_ids=ddp_ids, find_unused_parameters=ddp_unused)
 
-    ts_dataset = TimeMoEDataset(
-        data_folder=h.data_root,
-        normalization_method=getattr(h, "normalization_method", None),
-    )
-
-    trainset = TimeSeriesSegmentIterableDataset(
-        ts_dataset=ts_dataset,
+    trainset = SplitTimeSeriesCodecDataset(
+        split_manifest_path=h.split_manifest_path,
+        split=getattr(h, "train_split", "train"),
         segment_length=int(h.train_segment_length),
+        normalization_method=getattr(h, "normalization_method", None),
         samples_per_epoch=int(h.samples_per_epoch),
-        rank=rank,
-        world_size=world_size,
+        max_valid_sequences=int(getattr(h, "max_valid_sequences", 512)),
         seed=int(h.seed),
     )
+    if world_size > 1 and dist.is_initialized():
+        train_sampler = DistributedSampler(
+            trainset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            drop_last=True,
+        )
+    else:
+        train_sampler = None
     train_loader = DataLoader(
         trainset,
         batch_size=int(h.train_batch_size),
         num_workers=int(h.num_workers),
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
         pin_memory=True,
         drop_last=True,
         persistent_workers=(int(h.num_workers) > 0),
     )
 
-    evalset = TimeSeriesSegmentEvalDataset(
-        ts_dataset=ts_dataset,
+    evalset = SplitTimeSeriesCodecDataset(
+        split_manifest_path=h.split_manifest_path,
+        split=getattr(h, "valid_split", "valid"),
         segment_length=int(h.eval_segment_length),
-        max_eval_sequences=int(h.max_eval_sequences),
+        normalization_method=getattr(h, "normalization_method", None),
+        samples_per_epoch=1,  # unused for valid split
+        max_valid_sequences=int(getattr(h, "max_valid_sequences", 512)),
+        seed=int(h.seed),
     )
+    if world_size > 1 and dist.is_initialized():
+        eval_sampler = DistributedSampler(
+            evalset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=False,
+            drop_last=False,
+        )
+    else:
+        eval_sampler = None
     eval_loader = DataLoader(
         evalset,
         batch_size=int(h.eval_batch_size),
         num_workers=int(h.num_workers),
         shuffle=False,
+        sampler=eval_sampler,
         pin_memory=True,
         drop_last=False,
     )
@@ -172,6 +195,10 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
     encoder.train()
     decoder.train()
 
+    current_epoch = 0
+    trainset.set_epoch(current_epoch)
+    if train_sampler is not None:
+        train_sampler.set_epoch(current_epoch)
     train_iter = iter(train_loader)
 
     while steps < total_steps:
@@ -185,6 +212,10 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
         try:
             x = next(train_iter)
         except StopIteration:
+            current_epoch += 1
+            trainset.set_epoch(current_epoch)
+            if train_sampler is not None:
+                train_sampler.set_epoch(current_epoch)
             train_iter = iter(train_loader)
             x = next(train_iter)
 

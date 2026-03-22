@@ -5,29 +5,31 @@ ddp_find_unused_parameters: false
 seed: 1234
 
 # Data
-data_root: /mnt/shared-storage-gpfs2/speechllm-share/data/Time-300B/datasets--Maple728--Time-300B/snapshots/b52d0ca9de8da5202f73a5057681fca6b48906fb
+split_manifest_path: /mnt/shared-storage-gpfs2/brainllm2-share/junyi/time/configs/data_splits.example.json
+train_split: train
+valid_split: valid
 normalization_method: null
 
 # Segment sampling
-train_segment_length: 1024
-eval_segment_length: 1024
-samples_per_epoch: 200000
-max_eval_sequences: 512
+train_segment_length: 4096
+eval_segment_length: 4096
+samples_per_epoch: 100000
+max_valid_sequences: 2000
 
-# Model (1D sequence codec)
+# Model
 input_channels: 1
 output_channels: 1
 
 encoder_in_dim: 32
-encoder_num_layers: [4, 8, 12]
+encoder_num_layers: [2, 3, 4]
 down_ratio: [2, 2, 2]
 encoder_embed_kernel_size: 11
 
-seq_encoder_channel: 512
-seq_encoder_convnext_kernel_size: [6, 6, 6]
+seq_encoder_channel: 128
+seq_encoder_downsample_kernel_size: [6, 6, 6]
 seq_encoder_output_kernel_size: 11
 latent_output_conv_kernel_size: 11
-latent_dim: 32
+latent_dim: 16
 
 num_quantizers: 2
 stochastic: false
@@ -36,11 +38,11 @@ levels_1: [8, 5, 5, 5]
 levels_2: [8, 5, 5, 5]
 
 decoder_base_dim: 32
-decoder_num_layers: [12, 8, 4]
+decoder_num_layers: [4, 3, 2]
 up_ratio: [2, 2, 2]
 latent_input_conv_kernel_size: 11
 
-seq_decoder_channel: 512
+seq_decoder_channel: 128
 seq_decoder_input_kernel_size: 11
 seq_decoder_convnext_kernel_size: [6, 6, 6]
 seq_decoder_output_conv_kernel_size: 11
