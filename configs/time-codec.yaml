@@ -1,0 +1,68 @@
+runs_root: runs
+exp_name: time-codec-fsq
+ddp_backend: nccl
+ddp_find_unused_parameters: false
+seed: 1234
+
+# Data
+data_root: /mnt/shared-storage-gpfs2/speechllm-share/data/Time-300B/datasets--Maple728--Time-300B/snapshots/b52d0ca9de8da5202f73a5057681fca6b48906fb
+normalization_method: null
+
+# Segment sampling
+train_segment_length: 1024
+eval_segment_length: 1024
+samples_per_epoch: 200000
+max_eval_sequences: 512
+
+# Model (1D sequence codec)
+input_channels: 1
+output_channels: 1
+
+encoder_in_dim: 256
+encoder_num_layers: [4, 8, 12]
+down_ratio: [2, 2, 2]
+encoder_embed_kernel_size: 11
+
+seq_encoder_channel: 512
+seq_encoder_convnext_kernel_size: [6, 6, 6]
+seq_encoder_output_kernel_size: 11
+latent_output_conv_kernel_size: 11
+latent_dim: 32
+
+num_quantizers: 2
+stochastic: false
+temp_steps: 30000
+levels_1: [8, 5, 5, 5]
+levels_2: [8, 5, 5, 5]
+
+decoder_base_dim: 256
+decoder_num_layers: [12, 8, 4]
+up_ratio: [2, 2, 2]
+latent_input_conv_kernel_size: 11
+
+seq_decoder_channel: 512
+seq_decoder_input_kernel_size: 11
+seq_decoder_convnext_kernel_size: [6, 6, 6]
+seq_decoder_output_conv_kernel_size: 11
+
+# Optimization
+train_batch_size: 64
+eval_batch_size: 64
+num_workers: 4
+learning_rate: 0.001
+adam_b1: 0.8
+adam_b2: 0.9
+max_training_steps: 200000
+
+pct_start: 0.05
+div_factor: 25
+final_div_factor: 100
+
+recon_l1_weight: 1.0
+recon_mse_weight: 1.0
+diff_l1_weight: 0.1
+grad_clip_norm: 1.0
+
+stdout_interval: 50
+summary_interval: 50
+validation_interval: 1000
