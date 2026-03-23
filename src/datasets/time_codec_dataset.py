@@ -63,7 +63,7 @@ class SplitTimeSeriesCodecDataset(Dataset):
         split: str,
         segment_length: int,
         normalization_method=None,
-        samples_per_epoch: int = 100000,
+        samples_per_epoch: int = 500000,
         max_valid_sequences: int = 2000,
         seed: int = 1234,
     ):

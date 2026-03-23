@@ -23,7 +23,7 @@ score_mse_weight: 1.0
 # Segment sampling
 train_segment_length: 4096
 eval_segment_length: 4096
-samples_per_epoch: 1000000
+samples_per_epoch: 500000
 max_valid_sequences: 2000
 
 # Model
