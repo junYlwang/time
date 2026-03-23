@@ -17,14 +17,12 @@ revin_init_beta: 0.0
 revin_positive_gamma: false
 resume_skip_seen_batches: true
 keep_topk: 3
-score_l1_weight: 1.0
-score_mse_weight: 1.0
 
 # Segment sampling
 train_segment_length: 4096
 eval_segment_length: 4096
 samples_per_epoch: 500000
-max_valid_sequences: 2000
+max_valid_sequences: 5000
 
 # Model
 input_channels: 1
@@ -58,8 +56,8 @@ seq_decoder_convnext_kernel_size: [6, 6, 6]
 seq_decoder_output_conv_kernel_size: 11
 
 # Optimization
-train_batch_size: 64
-eval_batch_size: 64
+train_batch_size: 1024
+eval_batch_size: 1024
 num_workers: 4
 learning_rate: 0.0001
 adam_b1: 0.8
@@ -70,11 +68,11 @@ pct_start: 0.05
 div_factor: 25
 final_div_factor: 100
 
-recon_l1_weight: 1.0
-recon_mse_weight: 1.0
-diff_l1_weight: 0.1
+recon_smooth_l1_weight: 1.0
+smooth_l1_beta: 1.0
+diff_l1_weight: 1.0
 grad_clip_norm: 1.0
 
-stdout_interval: 50
-summary_interval: 50
+stdout_interval: 100
+summary_interval: 100
 validation_interval: 1000

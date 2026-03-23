@@ -77,6 +77,11 @@ def _set_quantizer_mode(encoder, stochastic: bool, temperature: float) -> None:
         enc.quantizer_2.temperature = temperature
 
 
+def _inverse_revin(norm_module, y: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
+    mod = norm_module.module if hasattr(norm_module, "module") else norm_module
+    return mod.inverse(y, mean, std)
+
+
 def _load_topk(path: str):
     if os.path.isfile(path):
         try:
@@ -314,47 +319,47 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
 
         z_q, _codes = encoder(x_in)
         x_hat_norm = decoder(z_q)
-        x_hat = input_norm.inverse(x_hat_norm, mu, std) if use_reversible_norm else x_hat_norm
+        x_hat = _inverse_revin(input_norm, x_hat_norm, mu, std) if use_reversible_norm else x_hat_norm
 
         tmin = min(x.size(-1), x_hat.size(-1))
         x_ref = x[..., :tmin]
         x_rec = x_hat[..., :tmin]
 
-        loss_l1 = F.l1_loss(x_rec, x_ref)
-        loss_mse = F.mse_loss(x_rec, x_ref)
+        loss_smooth_l1 = F.smooth_l1_loss(
+            x_rec,
+            x_ref,
+            beta=float(getattr(h, "smooth_l1_beta", 1.0)),
+        )
         if tmin > 1:
             loss_diff = F.l1_loss(torch.diff(x_rec, dim=-1), torch.diff(x_ref, dim=-1))
         else:
             loss_diff = torch.zeros((), device=device)
 
         total_loss = (
-            float(h.recon_l1_weight) * loss_l1
-            + float(h.recon_mse_weight) * loss_mse
+            float(getattr(h, "recon_smooth_l1_weight", getattr(h, "recon_l1_weight", 1.0))) * loss_smooth_l1
             + float(h.diff_l1_weight) * loss_diff
         )
 
         total_loss.backward()
-        # torch.nn.utils.clip_grad_norm_(itertools.chain(encoder.parameters(), decoder.parameters(), input_norm.parameters()),max_norm=float(getattr(h, "grad_clip_norm", 1.0)))
+        torch.nn.utils.clip_grad_norm_(itertools.chain(encoder.parameters(), decoder.parameters(), input_norm.parameters()),max_norm=float(getattr(h, "grad_clip_norm", 1.0)))
         optim_g.step()
         scheduler.step()
 
         steps += 1
 
         log_total = reduce_mean(total_loss, world_size).item()
-        log_l1 = reduce_mean(loss_l1, world_size).item()
-        log_mse = reduce_mean(loss_mse, world_size).item()
+        log_smooth_l1 = reduce_mean(loss_smooth_l1, world_size).item()
         log_diff = reduce_mean(loss_diff, world_size).item()
 
         if rank == 0 and steps % int(h.stdout_interval) == 0:
             print(
-                f"Steps: {steps} | Total: {log_total:.4f} | L1: {log_l1:.4f} | "
-                f"MSE: {log_mse:.4f} | Diff: {log_diff:.4f} | s/b: {time.time() - start:.3f}"
+                f"Steps: {steps} | Total: {log_total:.4f} | SmoothL1: {log_smooth_l1:.4f} | "
+                f"Diff: {log_diff:.4f} | s/b: {time.time() - start:.3f}"
             )
 
         if rank == 0 and sw is not None and steps % int(h.summary_interval) == 0:
             sw.add_scalar("train/total_loss", log_total, steps)
-            sw.add_scalar("train/recon_l1", log_l1, steps)
-            sw.add_scalar("train/recon_mse", log_mse, steps)
+            sw.add_scalar("train/recon_smooth_l1", log_smooth_l1, steps)
             sw.add_scalar("train/diff_l1", log_diff, steps)
             sw.add_scalar("train/lr", scheduler.get_last_lr()[0], steps)
 
@@ -366,8 +371,8 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
             if use_stochastic:
                 _set_quantizer_mode(encoder, stochastic=False, temperature=0.3)
 
-            eval_l1_sum = torch.zeros((), device=device)
-            eval_mse_sum = torch.zeros((), device=device)
+            eval_mae_sum = torch.zeros((), device=device)
+            eval_diff_sum = torch.zeros((), device=device)
             eval_n = torch.zeros((), device=device)
 
             with torch.no_grad():
@@ -379,33 +384,34 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
                         xb_in, xb_mu, xb_std = xb, None, None
                     zq, _ = encoder(xb_in)
                     xr_norm = decoder(zq)
-                    xr = input_norm.inverse(xr_norm, xb_mu, xb_std) if use_reversible_norm else xr_norm
+                    xr = _inverse_revin(input_norm, xr_norm, xb_mu, xb_std) if use_reversible_norm else xr_norm
                     tmin = min(xb.size(-1), xr.size(-1))
                     xb_ref = xb[..., :tmin]
                     xr_rec = xr[..., :tmin]
-                    l1 = F.l1_loss(xr_rec, xb_ref)
-                    mse = F.mse_loss(xr_rec, xb_ref)
-                    eval_l1_sum += l1
-                    eval_mse_sum += mse
+                    mae = F.l1_loss(xr_rec, xb_ref)
+                    if tmin > 1:
+                        diff = F.l1_loss(torch.diff(xr_rec, dim=-1), torch.diff(xb_ref, dim=-1))
+                    else:
+                        diff = torch.zeros((), device=device)
+                    eval_mae_sum += mae
+                    eval_diff_sum += diff
                     eval_n += 1.0
 
             if world_size > 1 and dist.is_initialized():
-                dist.all_reduce(eval_l1_sum, op=dist.ReduceOp.SUM)
-                dist.all_reduce(eval_mse_sum, op=dist.ReduceOp.SUM)
+                dist.all_reduce(eval_mae_sum, op=dist.ReduceOp.SUM)
+                dist.all_reduce(eval_diff_sum, op=dist.ReduceOp.SUM)
                 dist.all_reduce(eval_n, op=dist.ReduceOp.SUM)
 
-            eval_l1 = (eval_l1_sum / eval_n.clamp(min=1.0)).item()
-            eval_mse = (eval_mse_sum / eval_n.clamp(min=1.0)).item()
+            eval_mae = (eval_mae_sum / eval_n.clamp(min=1.0)).item()
+            eval_diff = (eval_diff_sum / eval_n.clamp(min=1.0)).item()
 
             if rank == 0:
                 if sw is not None:
-                    sw.add_scalar("valid/recon_l1", eval_l1, steps)
-                    sw.add_scalar("valid/recon_mse", eval_mse, steps)
+                    sw.add_scalar("valid/mae", eval_mae, steps)
+                    sw.add_scalar("valid/diff_l1", eval_diff, steps)
 
-                score = -(
-                    float(getattr(h, "score_l1_weight", 1.0)) * eval_l1
-                    + float(getattr(h, "score_mse_weight", 1.0)) * eval_mse
-                )
+                # Checkpoint selection depends only on MAE.
+                score = -eval_mae
                 save_checkpoint(
                     f"{h.checkpoint_path}/codec_steps={steps:08d}_score={score:.4f}",
                     {
