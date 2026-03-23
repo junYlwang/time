@@ -5,6 +5,7 @@ warnings.simplefilter(action="ignore", category=FutureWarning)
 
 import argparse
 import itertools
+import json
 import os
 import random
 import socket
@@ -28,8 +29,8 @@ _SRC_DIR = os.path.join(_PROJECT_ROOT, "src")
 if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
 
-from modules.encoder import Encoder as TimeSeriesEncoder
-from modules.decoder import Decoder as TimeSeriesDecoder
+from modules.encoder import Encoder
+from modules.decoder import Decoder
 from modules.revin import ReversibleInstanceNorm1D
 from modules.utils import load_hparams, build_env, load_checkpoint, save_checkpoint, get_state_dict
 from datasets.time_codec_dataset import SplitTimeSeriesCodecDataset
@@ -76,13 +77,64 @@ def _set_quantizer_mode(encoder, stochastic: bool, temperature: float) -> None:
         enc.quantizer_2.temperature = temperature
 
 
+def _load_topk(path: str):
+    if os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                return data
+        except Exception:
+            pass
+    return None
+
+
+def _save_topk(path: str, records):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(records, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def update_topk_and_prune(ckpt_dir: str, keep_k: int, score: float, steps: int):
+    if keep_k <= 0:
+        return []
+
+    record_path = os.path.join(ckpt_dir, "best_checkpoints.json")
+    records = _load_topk(record_path)
+    if records is None:
+        records = []
+
+    records.append(
+        {
+            "score": float(score),
+            "steps": int(steps),
+            "codec_path": os.path.join(ckpt_dir, f"codec_steps={steps:08d}_score={score:.4f}"),
+            "state_path": os.path.join(ckpt_dir, f"state_steps={steps:08d}_score={score:.4f}"),
+        }
+    )
+    records.sort(key=lambda r: (float(r["score"]), int(r["steps"])), reverse=True)
+
+    while len(records) > keep_k:
+        dropped = records.pop(-1)
+        for p in (dropped["codec_path"], dropped["state_path"]):
+            try:
+                if os.path.isfile(p):
+                    os.remove(p)
+            except Exception:
+                pass
+
+    _save_topk(record_path, records)
+    return records
+
+
 def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint: str = "") -> None:
     device = torch.device("cuda", local_rank) if torch.cuda.is_available() else torch.device("cpu")
 
     set_seed(int(h.seed) + rank)
 
-    encoder = TimeSeriesEncoder(h).to(device)
-    decoder = TimeSeriesDecoder(h).to(device)
+    encoder = Encoder(h).to(device)
+    decoder = Decoder(h).to(device)
     input_norm = ReversibleInstanceNorm1D(
         num_channels=int(getattr(h, "input_channels", 1)),
         eps=float(getattr(h, "revin_eps", 1e-5)),
@@ -103,6 +155,7 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
     )
 
     steps = 0
+    state_dict_scheduler = None
     cp_codec, cp_state = None, None
     if resume_from_checkpoint:
         cp_codec, cp_state = _infer_codec_state_paths(resume_from_checkpoint)
@@ -120,6 +173,9 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
             input_norm.load_state_dict(state_dict_codec["input_norm"], strict=True)
         optim_g.load_state_dict(state_dict_state["optim_g"])
         steps = int(state_dict_state["steps"])
+        if "scheduler" not in state_dict_state:
+            raise KeyError("Missing 'scheduler' in state checkpoint during resume")
+        state_dict_scheduler = state_dict_state["scheduler"]
 
     if world_size > 1 and dist.is_initialized():
         ddp_unused = bool(getattr(h, "ddp_find_unused_parameters", False))
@@ -134,7 +190,7 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
         segment_length=int(h.train_segment_length),
         normalization_method=getattr(h, "normalization_method", None),
         samples_per_epoch=int(h.samples_per_epoch),
-        max_valid_sequences=int(getattr(h, "max_valid_sequences", 512)),
+        max_valid_sequences=int(getattr(h, "max_valid_sequences", 2000)),
         seed=int(h.seed),
     )
     if world_size > 1 and dist.is_initialized():
@@ -164,7 +220,7 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
         segment_length=int(h.eval_segment_length),
         normalization_method=getattr(h, "normalization_method", None),
         samples_per_epoch=1,  # unused for valid split
-        max_valid_sequences=int(getattr(h, "max_valid_sequences", 512)),
+        max_valid_sequences=int(getattr(h, "max_valid_sequences", 2000)),
         seed=int(h.seed),
     )
     if world_size > 1 and dist.is_initialized():
@@ -199,9 +255,8 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
         last_epoch=-1,
     )
 
-    if steps > 0:
-        for _ in range(steps):
-            scheduler.step()
+    if resume_from_checkpoint:
+        scheduler.load_state_dict(state_dict_scheduler)
 
     sw = SummaryWriter(h.logs_dir) if rank == 0 else None
 
@@ -209,11 +264,24 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
     decoder.train()
     input_norm.train()
 
-    current_epoch = 0
+    steps_per_epoch = max(1, len(train_loader))
+    current_epoch = steps // steps_per_epoch
     trainset.set_epoch(current_epoch)
     if train_sampler is not None:
         train_sampler.set_epoch(current_epoch)
     train_iter = iter(train_loader)
+    steps_in_epoch = steps % steps_per_epoch
+    if steps_in_epoch > 0 and bool(getattr(h, "resume_skip_seen_batches", True)):
+        for _ in range(steps_in_epoch):
+            try:
+                next(train_iter)
+            except StopIteration:
+                current_epoch += 1
+                trainset.set_epoch(current_epoch)
+                if train_sampler is not None:
+                    train_sampler.set_epoch(current_epoch)
+                train_iter = iter(train_loader)
+                break
 
     while steps < total_steps:
         if use_stochastic:
@@ -266,10 +334,7 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
         )
 
         total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(
-            itertools.chain(encoder.parameters(), decoder.parameters(), input_norm.parameters()),
-            max_norm=float(getattr(h, "grad_clip_norm", 1.0)),
-        )
+        # torch.nn.utils.clip_grad_norm_(itertools.chain(encoder.parameters(), decoder.parameters(), input_norm.parameters()),max_norm=float(getattr(h, "grad_clip_norm", 1.0)))
         optim_g.step()
         scheduler.step()
 
@@ -282,8 +347,8 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
 
         if rank == 0 and steps % int(h.stdout_interval) == 0:
             print(
-                f"Steps: {steps} | Total: {log_total:.6f} | L1: {log_l1:.6f} | "
-                f"MSE: {log_mse:.6f} | Diff: {log_diff:.6f} | s/b: {time.time() - start:.3f}"
+                f"Steps: {steps} | Total: {log_total:.4f} | L1: {log_l1:.4f} | "
+                f"MSE: {log_mse:.4f} | Diff: {log_diff:.4f} | s/b: {time.time() - start:.3f}"
             )
 
         if rank == 0 and sw is not None and steps % int(h.summary_interval) == 0:
@@ -301,7 +366,8 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
             if use_stochastic:
                 _set_quantizer_mode(encoder, stochastic=False, temperature=0.3)
 
-            eval_loss_sum = torch.zeros((), device=device)
+            eval_l1_sum = torch.zeros((), device=device)
+            eval_mse_sum = torch.zeros((), device=device)
             eval_n = torch.zeros((), device=device)
 
             with torch.no_grad():
@@ -315,23 +381,33 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
                     xr_norm = decoder(zq)
                     xr = input_norm.inverse(xr_norm, xb_mu, xb_std) if use_reversible_norm else xr_norm
                     tmin = min(xb.size(-1), xr.size(-1))
-                    l = F.l1_loss(xr[..., :tmin], xb[..., :tmin])
-                    eval_loss_sum += l
+                    xb_ref = xb[..., :tmin]
+                    xr_rec = xr[..., :tmin]
+                    l1 = F.l1_loss(xr_rec, xb_ref)
+                    mse = F.mse_loss(xr_rec, xb_ref)
+                    eval_l1_sum += l1
+                    eval_mse_sum += mse
                     eval_n += 1.0
 
             if world_size > 1 and dist.is_initialized():
-                dist.all_reduce(eval_loss_sum, op=dist.ReduceOp.SUM)
+                dist.all_reduce(eval_l1_sum, op=dist.ReduceOp.SUM)
+                dist.all_reduce(eval_mse_sum, op=dist.ReduceOp.SUM)
                 dist.all_reduce(eval_n, op=dist.ReduceOp.SUM)
 
-            eval_l1 = (eval_loss_sum / eval_n.clamp(min=1.0)).item()
+            eval_l1 = (eval_l1_sum / eval_n.clamp(min=1.0)).item()
+            eval_mse = (eval_mse_sum / eval_n.clamp(min=1.0)).item()
 
             if rank == 0:
                 if sw is not None:
                     sw.add_scalar("valid/recon_l1", eval_l1, steps)
+                    sw.add_scalar("valid/recon_mse", eval_mse, steps)
 
-                score = -eval_l1
+                score = -(
+                    float(getattr(h, "score_l1_weight", 1.0)) * eval_l1
+                    + float(getattr(h, "score_mse_weight", 1.0)) * eval_mse
+                )
                 save_checkpoint(
-                    f"{h.checkpoint_path}/codec_steps={steps:08d}_score={score:.6f}",
+                    f"{h.checkpoint_path}/codec_steps={steps:08d}_score={score:.4f}",
                     {
                         "encoder": get_state_dict(encoder),
                         "decoder": get_state_dict(decoder),
@@ -339,12 +415,18 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
                     },
                 )
                 save_checkpoint(
-                    f"{h.checkpoint_path}/state_steps={steps:08d}_score={score:.6f}",
+                    f"{h.checkpoint_path}/state_steps={steps:08d}_score={score:.4f}",
                     {
                         "optim_g": optim_g.state_dict(),
                         "scheduler": scheduler.state_dict(),
                         "steps": steps,
                     },
+                )
+                update_topk_and_prune(
+                    h.checkpoint_path,
+                    int(getattr(h, "keep_topk", 3)),
+                    score,
+                    steps,
                 )
                 save_checkpoint(
                     f"{h.checkpoint_path}/codec_last",
