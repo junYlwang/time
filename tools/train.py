@@ -21,10 +21,6 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
-from modules.encoder import Encoder as TimeSeriesEncoder
-from modules.decoder import Decoder as TimeSeriesDecoder
-from modules.utils import load_hparams, build_env, load_checkpoint, save_checkpoint, get_state_dict
-from datasets.time_codec_dataset import SplitTimeSeriesCodecDataset
 
 _THIS_DIR = os.path.dirname(__file__)
 _PROJECT_ROOT = os.path.abspath(os.path.join(_THIS_DIR, ".."))
@@ -32,6 +28,11 @@ _SRC_DIR = os.path.join(_PROJECT_ROOT, "src")
 if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
 
+from modules.encoder import Encoder as TimeSeriesEncoder
+from modules.decoder import Decoder as TimeSeriesDecoder
+from modules.revin import ReversibleInstanceNorm1D
+from modules.utils import load_hparams, build_env, load_checkpoint, save_checkpoint, get_state_dict
+from datasets.time_codec_dataset import SplitTimeSeriesCodecDataset
 
 
 def set_seed(seed: int) -> None:
@@ -82,12 +83,21 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
 
     encoder = TimeSeriesEncoder(h).to(device)
     decoder = TimeSeriesDecoder(h).to(device)
+    input_norm = ReversibleInstanceNorm1D(
+        num_channels=int(getattr(h, "input_channels", 1)),
+        eps=float(getattr(h, "revin_eps", 1e-5)),
+        affine=bool(getattr(h, "revin_affine", True)),
+        init_gamma=float(getattr(h, "revin_init_gamma", 1.0)),
+        init_beta=float(getattr(h, "revin_init_beta", 0.0)),
+        positive_gamma=bool(getattr(h, "revin_positive_gamma", False)),
+    ).to(device)
+    use_reversible_norm = bool(getattr(h, "use_reversible_norm", True))
 
     use_stochastic = bool(getattr(h, "stochastic", False))
     temp_steps = int(getattr(h, "temp_steps", 30000))
 
     optim_g = torch.optim.AdamW(
-        itertools.chain(encoder.parameters(), decoder.parameters()),
+        itertools.chain(encoder.parameters(), decoder.parameters(), input_norm.parameters()),
         float(h.learning_rate),
         betas=[float(h.adam_b1), float(h.adam_b2)],
     )
@@ -106,6 +116,8 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
 
         encoder.load_state_dict(state_dict_codec["encoder"], strict=True)
         decoder.load_state_dict(state_dict_codec["decoder"], strict=True)
+        if "input_norm" in state_dict_codec:
+            input_norm.load_state_dict(state_dict_codec["input_norm"], strict=True)
         optim_g.load_state_dict(state_dict_state["optim_g"])
         steps = int(state_dict_state["steps"])
 
@@ -114,6 +126,7 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
         ddp_ids = [local_rank] if device.type == "cuda" else None
         encoder = DDP(encoder, device_ids=ddp_ids, find_unused_parameters=ddp_unused)
         decoder = DDP(decoder, device_ids=ddp_ids, find_unused_parameters=ddp_unused)
+        input_norm = DDP(input_norm, device_ids=ddp_ids, find_unused_parameters=ddp_unused)
 
     trainset = SplitTimeSeriesCodecDataset(
         split_manifest_path=h.split_manifest_path,
@@ -194,6 +207,7 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
 
     encoder.train()
     decoder.train()
+    input_norm.train()
 
     current_epoch = 0
     trainset.set_epoch(current_epoch)
@@ -225,8 +239,14 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
 
         optim_g.zero_grad()
 
-        z_q, _codes = encoder(x)
-        x_hat = decoder(z_q)
+        if use_reversible_norm:
+            x_in, mu, std = input_norm(x)
+        else:
+            x_in, mu, std = x, None, None
+
+        z_q, _codes = encoder(x_in)
+        x_hat_norm = decoder(z_q)
+        x_hat = input_norm.inverse(x_hat_norm, mu, std) if use_reversible_norm else x_hat_norm
 
         tmin = min(x.size(-1), x_hat.size(-1))
         x_ref = x[..., :tmin]
@@ -247,7 +267,7 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
 
         total_loss.backward()
         torch.nn.utils.clip_grad_norm_(
-            itertools.chain(encoder.parameters(), decoder.parameters()),
+            itertools.chain(encoder.parameters(), decoder.parameters(), input_norm.parameters()),
             max_norm=float(getattr(h, "grad_clip_norm", 1.0)),
         )
         optim_g.step()
@@ -276,6 +296,7 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
         if steps % int(h.validation_interval) == 0:
             encoder.eval()
             decoder.eval()
+            input_norm.eval()
 
             if use_stochastic:
                 _set_quantizer_mode(encoder, stochastic=False, temperature=0.3)
@@ -286,8 +307,13 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
             with torch.no_grad():
                 for xb in eval_loader:
                     xb = xb.to(device, non_blocking=True)
-                    zq, _ = encoder(xb)
-                    xr = decoder(zq)
+                    if use_reversible_norm:
+                        xb_in, xb_mu, xb_std = input_norm(xb)
+                    else:
+                        xb_in, xb_mu, xb_std = xb, None, None
+                    zq, _ = encoder(xb_in)
+                    xr_norm = decoder(zq)
+                    xr = input_norm.inverse(xr_norm, xb_mu, xb_std) if use_reversible_norm else xr_norm
                     tmin = min(xb.size(-1), xr.size(-1))
                     l = F.l1_loss(xr[..., :tmin], xb[..., :tmin])
                     eval_loss_sum += l
@@ -306,7 +332,11 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
                 score = -eval_l1
                 save_checkpoint(
                     f"{h.checkpoint_path}/codec_steps={steps:08d}_score={score:.6f}",
-                    {"encoder": get_state_dict(encoder), "decoder": get_state_dict(decoder)},
+                    {
+                        "encoder": get_state_dict(encoder),
+                        "decoder": get_state_dict(decoder),
+                        "input_norm": get_state_dict(input_norm),
+                    },
                 )
                 save_checkpoint(
                     f"{h.checkpoint_path}/state_steps={steps:08d}_score={score:.6f}",
@@ -318,7 +348,11 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
                 )
                 save_checkpoint(
                     f"{h.checkpoint_path}/codec_last",
-                    {"encoder": get_state_dict(encoder), "decoder": get_state_dict(decoder)},
+                    {
+                        "encoder": get_state_dict(encoder),
+                        "decoder": get_state_dict(decoder),
+                        "input_norm": get_state_dict(input_norm),
+                    },
                 )
                 save_checkpoint(
                     f"{h.checkpoint_path}/state_last",
@@ -331,6 +365,7 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
 
             encoder.train()
             decoder.train()
+            input_norm.train()
 
     if rank == 0 and sw is not None:
         sw.close()

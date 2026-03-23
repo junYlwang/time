@@ -9,6 +9,12 @@ split_manifest_path: /mnt/shared-storage-gpfs2/brainllm2-share/junyi/time/config
 train_split: train
 valid_split: valid
 normalization_method: null
+use_reversible_norm: true
+revin_eps: 1.0e-5
+revin_affine: true
+revin_init_gamma: 1.0
+revin_init_beta: 0.0
+revin_positive_gamma: false
 
 # Segment sampling
 train_segment_length: 4096
