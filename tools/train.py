@@ -82,6 +82,25 @@ def _inverse_revin(norm_module, y: torch.Tensor, mean: torch.Tensor, std: torch.
     return mod.inverse(y, mean, std)
 
 
+def _update_codebook_coverage_masks(codes: torch.Tensor, mask_l1: torch.Tensor, mask_l2: torch.Tensor) -> None:
+    # codes: [B, Q, T], where Q=2 for two residual quantizers.
+    if codes.dim() != 3 or codes.size(1) < 2:
+        raise ValueError(f"Expected codes with shape [B, Q, T] and Q>=2, got {tuple(codes.shape)}")
+
+    idx_l1 = codes[:, 0, :].detach().reshape(-1).long().clamp_(0, mask_l1.numel() - 1)
+    idx_l2 = codes[:, 1, :].detach().reshape(-1).long().clamp_(0, mask_l2.numel() - 1)
+    mask_l1[idx_l1] = True
+    mask_l2[idx_l2] = True
+
+
+def _compute_global_codebook_coverage(mask: torch.Tensor, world_size: int) -> float:
+    global_mask = mask.float()
+    if world_size > 1 and dist.is_initialized():
+        dist.all_reduce(global_mask, op=dist.ReduceOp.MAX)
+    used = (global_mask > 0.5).sum().item()
+    return float(used / max(1, global_mask.numel()))
+
+
 def _load_topk(path: str):
     if os.path.isfile(path):
         try:
@@ -152,6 +171,7 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
 
     use_stochastic = bool(getattr(h, "stochastic", False))
     temp_steps = int(getattr(h, "temp_steps", 30000))
+    coverage_interval = max(1, int(getattr(h, "codebook_coverage_interval", 1000))
 
     optim_g = torch.optim.AdamW(
         itertools.chain(encoder.parameters(), decoder.parameters(), input_norm.parameters()),
@@ -269,6 +289,14 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
     decoder.train()
     input_norm.train()
 
+    enc_for_cov = encoder.module if hasattr(encoder, "module") else encoder
+    if not hasattr(enc_for_cov, "quantizer_1") or not hasattr(enc_for_cov, "quantizer_2"):
+        raise AttributeError("Encoder must have quantizer_1 and quantizer_2 for codebook coverage tracking.")
+    codebook_size_1 = int(getattr(enc_for_cov.quantizer_1, "codebook_size"))
+    codebook_size_2 = int(getattr(enc_for_cov.quantizer_2, "codebook_size"))
+    used_indices_mask_1 = torch.zeros(codebook_size_1, device=device, dtype=torch.bool)
+    used_indices_mask_2 = torch.zeros(codebook_size_2, device=device, dtype=torch.bool)
+
     steps_per_epoch = max(1, len(train_loader))
     current_epoch = steps // steps_per_epoch
     trainset.set_epoch(current_epoch)
@@ -318,6 +346,8 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
             x_in, mu, std = x, None, None
 
         z_q, _codes = encoder(x_in)
+        with torch.no_grad():
+            _update_codebook_coverage_masks(_codes, used_indices_mask_1, used_indices_mask_2)
         x_hat_norm = decoder(z_q)
         x_hat = _inverse_revin(input_norm, x_hat_norm, mu, std) if use_reversible_norm else x_hat_norm
 
@@ -362,6 +392,20 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
             sw.add_scalar("train/recon_smooth_l1", log_smooth_l1, steps)
             sw.add_scalar("train/diff_l1", log_diff, steps)
             sw.add_scalar("train/lr", scheduler.get_last_lr()[0], steps)
+
+        if steps % coverage_interval == 0:
+            coverage_l1 = _compute_global_codebook_coverage(used_indices_mask_1, world_size)
+            coverage_l2 = _compute_global_codebook_coverage(used_indices_mask_2, world_size)
+            if rank == 0:
+                if sw is not None:
+                    sw.add_scalar("train/codebook_coverage_l1", coverage_l1, steps)
+                    sw.add_scalar("train/codebook_coverage_l2", coverage_l2, steps)
+                print(
+                    f"Steps: {steps} | Codebook Coverage L1: {coverage_l1:.4f} | "
+                    f"Codebook Coverage L2: {coverage_l2:.4f}"
+                )
+            used_indices_mask_1.zero_()
+            used_indices_mask_2.zero_()
 
         if steps % int(h.validation_interval) == 0:
             encoder.eval()
