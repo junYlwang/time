@@ -171,7 +171,7 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
 
     use_stochastic = bool(getattr(h, "stochastic", False))
     temp_steps = int(getattr(h, "temp_steps", 30000))
-    coverage_interval = max(1, int(getattr(h, "codebook_coverage_interval", 1000))
+    coverage_interval = max(1, int(getattr(h, "codebook_coverage_interval", 1000)))
 
     optim_g = torch.optim.AdamW(
         itertools.chain(encoder.parameters(), decoder.parameters(), input_norm.parameters()),
