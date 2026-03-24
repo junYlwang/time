@@ -29,8 +29,9 @@ _SRC_DIR = os.path.join(_PROJECT_ROOT, "src")
 if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
 
-from modules.encoder import Encoder
+from modules.encoder_wo_quantize import Encoder
 from modules.decoder import Decoder
+from modules.quantizer import build_quantizer
 from modules.revin import ReversibleInstanceNorm1D
 from modules.utils import load_hparams, build_env, load_checkpoint, save_checkpoint, get_state_dict
 from datasets.time_codec_dataset import SplitTimeSeriesCodecDataset
@@ -67,14 +68,10 @@ def _infer_codec_state_paths(resume_path: str) -> Tuple[str, str]:
     return codec_path, state_path
 
 
-def _set_quantizer_mode(encoder, stochastic: bool, temperature: float) -> None:
-    enc = encoder.module if hasattr(encoder, "module") else encoder
-    if hasattr(enc, "quantizer_1") and enc.quantizer_1 is not None:
-        enc.quantizer_1.stochastic = stochastic
-        enc.quantizer_1.temperature = temperature
-    if hasattr(enc, "quantizer_2") and enc.quantizer_2 is not None:
-        enc.quantizer_2.stochastic = stochastic
-        enc.quantizer_2.temperature = temperature
+def _set_quantizer_mode(quantizer, stochastic: bool, temperature: float) -> None:
+    q = quantizer.module if hasattr(quantizer, "module") else quantizer
+    if hasattr(q, "set_stochastic_mode"):
+        q.set_stochastic_mode(stochastic=stochastic, temperature=temperature)
 
 
 def _inverse_revin(norm_module, y: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
@@ -158,6 +155,7 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
     set_seed(int(h.seed) + rank)
 
     encoder = Encoder(h).to(device)
+    quantizer = build_quantizer(h).to(device)
     decoder = Decoder(h).to(device)
     input_norm = ReversibleInstanceNorm1D(
         num_channels=int(getattr(h, "input_channels", 1)),
@@ -171,10 +169,11 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
 
     use_stochastic = bool(getattr(h, "stochastic", False))
     temp_steps = int(getattr(h, "temp_steps", 30000))
-    coverage_interval = max(1, int(getattr(h, "codebook_coverage_interval", 1000)))
+    quantizer_loss_weight = float(getattr(h, "quantizer_loss_weight", 1.0))
+    coverage_interval = max(1, int(getattr(h, "codebook_coverage_interval", getattr(h, "summary_interval", 1000))))
 
     optim_g = torch.optim.AdamW(
-        itertools.chain(encoder.parameters(), decoder.parameters(), input_norm.parameters()),
+        itertools.chain(encoder.parameters(), quantizer.parameters(), decoder.parameters(), input_norm.parameters()),
         float(h.learning_rate),
         betas=[float(h.adam_b1), float(h.adam_b2)],
     )
@@ -193,6 +192,7 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
         state_dict_state = load_checkpoint(cp_state, device)
 
         encoder.load_state_dict(state_dict_codec["encoder"], strict=True)
+        quantizer.load_state_dict(state_dict_codec["quantizer"], strict=True)
         decoder.load_state_dict(state_dict_codec["decoder"], strict=True)
         if "input_norm" in state_dict_codec:
             input_norm.load_state_dict(state_dict_codec["input_norm"], strict=True)
@@ -206,6 +206,7 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
         ddp_unused = bool(getattr(h, "ddp_find_unused_parameters", False))
         ddp_ids = [local_rank] if device.type == "cuda" else None
         encoder = DDP(encoder, device_ids=ddp_ids, find_unused_parameters=ddp_unused)
+        quantizer = DDP(quantizer, device_ids=ddp_ids, find_unused_parameters=ddp_unused)
         decoder = DDP(decoder, device_ids=ddp_ids, find_unused_parameters=ddp_unused)
         input_norm = DDP(input_norm, device_ids=ddp_ids, find_unused_parameters=ddp_unused)
 
@@ -286,16 +287,18 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
     sw = SummaryWriter(h.logs_dir) if rank == 0 else None
 
     encoder.train()
+    quantizer.train()
     decoder.train()
     input_norm.train()
 
-    enc_for_cov = encoder.module if hasattr(encoder, "module") else encoder
-    if not hasattr(enc_for_cov, "quantizer_1") or not hasattr(enc_for_cov, "quantizer_2"):
-        raise AttributeError("Encoder must have quantizer_1 and quantizer_2 for codebook coverage tracking.")
-    codebook_size_1 = int(getattr(enc_for_cov.quantizer_1, "codebook_size"))
-    codebook_size_2 = int(getattr(enc_for_cov.quantizer_2, "codebook_size"))
-    used_indices_mask_1 = torch.zeros(codebook_size_1, device=device, dtype=torch.bool)
-    used_indices_mask_2 = torch.zeros(codebook_size_2, device=device, dtype=torch.bool)
+    quantizer_for_cov = quantizer.module if hasattr(quantizer, "module") else quantizer
+    codebook_sizes = tuple(getattr(quantizer_for_cov, "codebook_sizes", ()))
+    if len(codebook_sizes) >= 2:
+        used_indices_mask_1 = torch.zeros(int(codebook_sizes[0]), device=device, dtype=torch.bool)
+        used_indices_mask_2 = torch.zeros(int(codebook_sizes[1]), device=device, dtype=torch.bool)
+    else:
+        used_indices_mask_1 = None
+        used_indices_mask_2 = None
 
     steps_per_epoch = max(1, len(train_loader))
     current_epoch = steps // steps_per_epoch
@@ -317,12 +320,12 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
                 break
 
     while steps < total_steps:
-        if use_stochastic:
+        if use_stochastic and bool(getattr(quantizer_for_cov, "is_stochastic_quantizer", False)):
             if steps <= temp_steps:
                 current_temp = max(0.3, 1.0 - (steps / max(1, temp_steps)))
             else:
                 current_temp = 0.3
-            _set_quantizer_mode(encoder, stochastic=True, temperature=current_temp)
+            _set_quantizer_mode(quantizer, stochastic=True, temperature=current_temp)
 
         try:
             x = next(train_iter)
@@ -345,9 +348,14 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
         else:
             x_in, mu, std = x, None, None
 
-        z_q, _codes = encoder(x_in)
-        with torch.no_grad():
-            _update_codebook_coverage_masks(_codes, used_indices_mask_1, used_indices_mask_2)
+        latent = encoder(x_in)
+        quant_out = quantizer(latent)
+        z_q = quant_out.z_q
+        _codes = quant_out.codes
+        q_loss = quant_out.q_loss
+        if _codes is not None and used_indices_mask_1 is not None and used_indices_mask_2 is not None:
+            with torch.no_grad():
+                _update_codebook_coverage_masks(_codes, used_indices_mask_1, used_indices_mask_2)
         x_hat_norm = decoder(z_q)
         x_hat = _inverse_revin(input_norm, x_hat_norm, mu, std) if use_reversible_norm else x_hat_norm
 
@@ -368,10 +376,14 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
         total_loss = (
             float(getattr(h, "recon_smooth_l1_weight", getattr(h, "recon_l1_weight", 1.0))) * loss_smooth_l1
             + float(h.diff_l1_weight) * loss_diff
+            + quantizer_loss_weight * q_loss
         )
 
         total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(itertools.chain(encoder.parameters(), decoder.parameters(), input_norm.parameters()),max_norm=float(getattr(h, "grad_clip_norm", 1.0)))
+        torch.nn.utils.clip_grad_norm_(
+            itertools.chain(encoder.parameters(), quantizer.parameters(), decoder.parameters(), input_norm.parameters()),
+            max_norm=float(getattr(h, "grad_clip_norm", 1.0)),
+        )
         optim_g.step()
         scheduler.step()
 
@@ -380,20 +392,26 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
         log_total = reduce_mean(total_loss, world_size).item()
         log_smooth_l1 = reduce_mean(loss_smooth_l1, world_size).item()
         log_diff = reduce_mean(loss_diff, world_size).item()
+        log_q = reduce_mean(q_loss, world_size).item()
 
         if rank == 0 and steps % int(h.stdout_interval) == 0:
             print(
                 f"Steps: {steps} | Total: {log_total:.4f} | SmoothL1: {log_smooth_l1:.4f} | "
-                f"Diff: {log_diff:.4f} | s/b: {time.time() - start:.3f}"
+                f"Diff: {log_diff:.4f} | Q: {log_q:.4f} | s/b: {time.time() - start:.3f}"
             )
 
         if rank == 0 and sw is not None and steps % int(h.summary_interval) == 0:
             sw.add_scalar("train/total_loss", log_total, steps)
             sw.add_scalar("train/recon_smooth_l1", log_smooth_l1, steps)
             sw.add_scalar("train/diff_l1", log_diff, steps)
+            sw.add_scalar("train/quantizer_loss", log_q, steps)
             sw.add_scalar("train/lr", scheduler.get_last_lr()[0], steps)
 
-        if steps % coverage_interval == 0:
+        if (
+            steps % coverage_interval == 0
+            and used_indices_mask_1 is not None
+            and used_indices_mask_2 is not None
+        ):
             coverage_l1 = _compute_global_codebook_coverage(used_indices_mask_1, world_size)
             coverage_l2 = _compute_global_codebook_coverage(used_indices_mask_2, world_size)
             if rank == 0:
@@ -409,11 +427,12 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
 
         if steps % int(h.validation_interval) == 0:
             encoder.eval()
+            quantizer.eval()
             decoder.eval()
             input_norm.eval()
 
-            if use_stochastic:
-                _set_quantizer_mode(encoder, stochastic=False, temperature=0.3)
+            if use_stochastic and bool(getattr(quantizer_for_cov, "is_stochastic_quantizer", False)):
+                _set_quantizer_mode(quantizer, stochastic=False, temperature=0.3)
 
             eval_mae_sum = torch.zeros((), device=device)
             eval_diff_sum = torch.zeros((), device=device)
@@ -426,7 +445,8 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
                         xb_in, xb_mu, xb_std = input_norm(xb)
                     else:
                         xb_in, xb_mu, xb_std = xb, None, None
-                    zq, _ = encoder(xb_in)
+                    latent_b = encoder(xb_in)
+                    zq = quantizer(latent_b).z_q
                     xr_norm = decoder(zq)
                     xr = _inverse_revin(input_norm, xr_norm, xb_mu, xb_std) if use_reversible_norm else xr_norm
                     tmin = min(xb.size(-1), xr.size(-1))
@@ -460,6 +480,7 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
                     f"{h.checkpoint_path}/codec_steps={steps:08d}_score={score:.4f}",
                     {
                         "encoder": get_state_dict(encoder),
+                        "quantizer": get_state_dict(quantizer),
                         "decoder": get_state_dict(decoder),
                         "input_norm": get_state_dict(input_norm),
                     },
@@ -482,6 +503,7 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
                     f"{h.checkpoint_path}/codec_last",
                     {
                         "encoder": get_state_dict(encoder),
+                        "quantizer": get_state_dict(quantizer),
                         "decoder": get_state_dict(decoder),
                         "input_norm": get_state_dict(input_norm),
                     },
@@ -496,6 +518,7 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
                 )
 
             encoder.train()
+            quantizer.train()
             decoder.train()
             input_norm.train()
 
@@ -507,7 +530,7 @@ def main() -> None:
     print("Initializing Time-Series Codec Training Process...")
     parser = argparse.ArgumentParser()
 
-    default_config = os.path.join(_PROJECT_ROOT, "configs", "time-codec.yaml")
+    default_config = os.path.join(_PROJECT_ROOT, "configs", "time-codec-1000.yaml")
     parser.add_argument("--config", type=str, default=default_config, help="Path to config YAML")
     parser.add_argument("--resume_from_checkpoint", type=str, default="", help="Path to codec_* or state_* checkpoint")
     args = parser.parse_args()

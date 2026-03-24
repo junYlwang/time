@@ -40,10 +40,16 @@ latent_output_conv_kernel_size: 11
 latent_dim: 16
 
 num_quantizers: 2
+quantizer_type: none
 stochastic: false
 temp_steps: 30000
 levels_1: [8, 5, 5, 5]
 levels_2: [8, 5, 5, 5]
+rvq_codebook_size: 1024
+rvq_codebook_dim: 16
+rvq_decay: 0.99
+rvq_quantize_dropout: false
+rvq_quantize_dropout_cutoff_index: 0
 
 decoder_base_dim: 32
 decoder_num_layers: [4, 3, 2]
@@ -72,6 +78,7 @@ recon_smooth_l1_weight: 1.0
 smooth_l1_beta: 1.0
 diff_l1_weight: 1.0
 grad_clip_norm: 1.0
+quantizer_loss_weight: 1.0
 
 stdout_interval: 100
 summary_interval: 100
