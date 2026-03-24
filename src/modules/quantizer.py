@@ -152,11 +152,11 @@ class NoQuantizer(BaseQuantizer):
 
 
 def build_quantizer(h) -> BaseQuantizer:
-    quantizer_type = str(getattr(h, "quantizer_type", "fsq")).lower()
-    if quantizer_type == "fsq":
+    quantizer_type = str(getattr(h, "quantizer_type", "rfsq")).lower()
+    if quantizer_type == "rfsq":
         return FSQResidualQuantizer(h)
     if quantizer_type == "rvq":
         return RVQQuantizer(h)
     if quantizer_type == "none":
         return NoQuantizer()
-    raise ValueError(f"Unsupported quantizer_type: {quantizer_type}. Expected one of: fsq, rvq, none.")
+    raise ValueError(f"Unsupported quantizer_type: {quantizer_type}. Expected one of: rfsq, rvq, none.")

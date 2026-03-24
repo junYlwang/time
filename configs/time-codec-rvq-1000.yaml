@@ -1,5 +1,5 @@
 runs_root: runs
-exp_name: time-codec-fsq-4000
+exp_name: time-codec-rvq-1000
 ddp_backend: nccl
 ddp_find_unused_parameters: false
 seed: 1234
@@ -40,12 +40,12 @@ latent_output_conv_kernel_size: 11
 latent_dim: 16
 
 num_quantizers: 2
-quantizer_type: fsq
+quantizer_type: rvq
 stochastic: false
 temp_steps: 30000
-levels_1: [8, 8, 8, 8]
-levels_2: [8, 8, 8, 8]
-rvq_codebook_size: 4096
+levels_1: [8, 5, 5, 5]
+levels_2: [8, 5, 5, 5]
+rvq_codebook_size: 1000
 rvq_codebook_dim: 8
 rvq_decay: 0.99
 rvq_quantize_dropout: false
