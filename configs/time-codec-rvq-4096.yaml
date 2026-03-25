@@ -1,5 +1,5 @@
 runs_root: runs
-exp_name: time-codec-wo-quantize
+exp_name: time-codec-rvq-4096
 ddp_backend: nccl
 ddp_find_unused_parameters: false
 seed: 1234
@@ -40,13 +40,13 @@ latent_output_conv_kernel_size: 11
 latent_dim: 16
 
 num_quantizers: 2
-quantizer_type: none
+quantizer_type: rvq
 stochastic: false
 temp_steps: 30000
-levels_1: [8, 5, 5, 5]
-levels_2: [8, 5, 5, 5]
-rvq_codebook_size: 1024
-rvq_codebook_dim: 16
+levels_1: [8, 8, 8, 8]
+levels_2: [8, 8, 8, 8]
+rvq_codebook_size: 4096
+rvq_codebook_dim: 8
 rvq_decay: 0.99
 rvq_quantize_dropout: false
 rvq_quantize_dropout_cutoff_index: 0
@@ -68,7 +68,7 @@ num_workers: 4
 learning_rate: 0.0001
 adam_b1: 0.8
 adam_b2: 0.9
-max_training_steps: 1000000
+max_training_steps: 2000000
 
 pct_start: 0.05
 div_factor: 25
@@ -82,11 +82,12 @@ quantizer_loss_weight: 1.0
 
 stdout_interval: 100
 summary_interval: 100
+codebook_coverage_interval: 1000
 validation_interval: 1000
 
 # Inference
 inference:
   test_split: test
-  checkpoint_path: /mnt/shared-storage-gpfs2/brainllm2-share/junyi/time/runs/time-codec-wo-quantize/2026-03-23_16-56-34__seed1234__gpu1/checkpoints/codec_steps=00193000_score=-2.1420
-  output_dir: /mnt/shared-storage-gpfs2/brainllm2-share/junyi/time/runs/time-codec-wo-quantize/2026-03-23_16-56-34__seed1234__gpu1
+  checkpoint_path: /path/to/codec_checkpoint
+  output_dir: /mnt/shared-storage-gpfs2/brainllm2-share/junyi/time/runs/time-codec-rvq-4096/2026-03-23_16-56-34__seed1234__gpu1
   num_visual_samples: 3

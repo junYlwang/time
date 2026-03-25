@@ -1,5 +1,5 @@
 runs_root: runs
-exp_name: time-codec-rfsq-4000
+exp_name: time-codec-rfsq-4096
 ddp_backend: nccl
 ddp_find_unused_parameters: false
 seed: 1234
@@ -40,7 +40,7 @@ latent_output_conv_kernel_size: 11
 latent_dim: 16
 
 num_quantizers: 2
-quantizer_type: fsq
+quantizer_type: rfsq
 stochastic: false
 temp_steps: 30000
 levels_1: [8, 8, 8, 8]
@@ -84,3 +84,10 @@ stdout_interval: 100
 summary_interval: 100
 codebook_coverage_interval: 1000
 validation_interval: 1000
+
+# Inference
+inference:
+  test_split: test
+  checkpoint_path: /path/to/codec_checkpoint
+  output_dir: /mnt/shared-storage-gpfs2/brainllm2-share/junyi/time/runs/time-codec-rfsq-4096/2026-03-23_16-56-34__seed1234__gpu1
+  num_visual_samples: 3

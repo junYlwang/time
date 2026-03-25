@@ -84,3 +84,10 @@ stdout_interval: 100
 summary_interval: 100
 codebook_coverage_interval: 1000
 validation_interval: 1000
+
+# Inference
+inference:
+  test_split: test
+  checkpoint_path: /path/to/codec_checkpoint
+  output_dir: /mnt/shared-storage-gpfs2/brainllm2-share/junyi/time/runs/time-codec-rvq-1000/2026-03-23_16-56-34__seed1234__gpu1
+  num_visual_samples: 3
