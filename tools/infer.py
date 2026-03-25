@@ -50,6 +50,8 @@ def _inverse_revin(norm_module, y: torch.Tensor, mean: torch.Tensor, std: torch.
 
 
 def _set_quantizer_eval_mode(quantizer) -> None:
+    if quantizer is None:
+        return
     q = quantizer.module if hasattr(quantizer, "module") else quantizer
     if hasattr(q, "set_stochastic_mode"):
         q.set_stochastic_mode(stochastic=False, temperature=0.3)
@@ -214,13 +216,22 @@ def _load_codec_checkpoint(h, device: torch.device):
 
     state = load_checkpoint(checkpoint_path, device)
     encoder.load_state_dict(state["encoder"], strict=True)
-    quantizer.load_state_dict(state["quantizer"], strict=True)
+    has_quantizer_ckpt = "quantizer" in state
+    if has_quantizer_ckpt:
+        quantizer.load_state_dict(state["quantizer"], strict=True)
+    else:
+        quantizer = None
+        print(
+            "[Warn] No 'quantizer' found in checkpoint. "
+            "Using no-quantizer inference path for compatibility."
+        )
     decoder.load_state_dict(state["decoder"], strict=True)
     if "input_norm" in state:
         input_norm.load_state_dict(state["input_norm"], strict=True)
 
     encoder.eval()
-    quantizer.eval()
+    if quantizer is not None:
+        quantizer.eval()
     decoder.eval()
     input_norm.eval()
     _set_quantizer_eval_mode(quantizer)
@@ -291,7 +302,7 @@ def _infer_one_subset(
                 x_in, mu, std = x, None, None
 
             latent = encoder(x_in)
-            zq = quantizer(latent).z_q
+            zq = quantizer(latent).z_q if quantizer is not None else latent
             x_hat_norm = decoder(zq)
             x_hat = _inverse_revin(input_norm, x_hat_norm, mu, std) if use_reversible_norm else x_hat_norm
 
