@@ -31,6 +31,7 @@ if _SRC_DIR not in sys.path:
 
 from modules.encoder_wo_quantize import Encoder
 from modules.decoder import Decoder
+from modules.loss import MultiScaleLogMagSTFTLoss
 from modules.quantizer import build_quantizer
 from modules.revin import ReversibleInstanceNorm1D
 from modules.utils import load_hparams, build_env, load_checkpoint, save_checkpoint, get_state_dict
@@ -170,6 +171,9 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
     use_stochastic = bool(getattr(h, "stochastic", False))
     temp_steps = int(getattr(h, "temp_steps", 30000))
     quantizer_loss_weight = float(getattr(h, "quantizer_loss_weight", 1.0))
+    stft_loss_weight = float(getattr(h, "stft_loss_weight", 0.0))
+    stft_win_sizes = list(getattr(h, "stft_win_sizes", [128, 256, 512]))
+    stft_loss_fn = MultiScaleLogMagSTFTLoss(win_sizes=stft_win_sizes).to(device)
     coverage_interval = max(1, int(getattr(h, "codebook_coverage_interval", getattr(h, "summary_interval", 1000))))
 
     optim_g = torch.optim.AdamW(
@@ -372,10 +376,15 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
             loss_diff = F.l1_loss(torch.diff(x_rec, dim=-1), torch.diff(x_ref, dim=-1))
         else:
             loss_diff = torch.zeros((), device=device)
+        if stft_loss_weight > 0.0:
+            loss_stft = stft_loss_fn(x_rec, x_ref)
+        else:
+            loss_stft = torch.zeros((), device=device)
 
         total_loss = (
             float(getattr(h, "recon_smooth_l1_weight", getattr(h, "recon_l1_weight", 1.0))) * loss_smooth_l1
             + float(h.diff_l1_weight) * loss_diff
+            + stft_loss_weight * loss_stft
             + quantizer_loss_weight * q_loss
         )
 
@@ -392,18 +401,20 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
         log_total = reduce_mean(total_loss, world_size).item()
         log_smooth_l1 = reduce_mean(loss_smooth_l1, world_size).item()
         log_diff = reduce_mean(loss_diff, world_size).item()
+        log_stft = reduce_mean(loss_stft, world_size).item()
         log_q = reduce_mean(q_loss, world_size).item()
 
         if rank == 0 and steps % int(h.stdout_interval) == 0:
             print(
                 f"Steps: {steps} | Total: {log_total:.4f} | SmoothL1: {log_smooth_l1:.4f} | "
-                f"Diff: {log_diff:.4f} | Q: {log_q:.4f} | s/b: {time.time() - start:.3f}"
+                f"Diff: {log_diff:.4f} | STFT: {log_stft:.4f} | Q: {log_q:.4f} | s/b: {time.time() - start:.3f}"
             )
 
         if rank == 0 and sw is not None and steps % int(h.summary_interval) == 0:
             sw.add_scalar("train/total_loss", log_total, steps)
             sw.add_scalar("train/recon_smooth_l1", log_smooth_l1, steps)
             sw.add_scalar("train/diff_l1", log_diff, steps)
+            sw.add_scalar("train/stft_loss", log_stft, steps)
             sw.add_scalar("train/quantizer_loss", log_q, steps)
             sw.add_scalar("train/lr", scheduler.get_last_lr()[0], steps)
 
@@ -436,6 +447,7 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
 
             eval_mae_sum = torch.zeros((), device=device)
             eval_diff_sum = torch.zeros((), device=device)
+            eval_stft_sum = torch.zeros((), device=device)
             eval_n = torch.zeros((), device=device)
 
             with torch.no_grad():
@@ -457,22 +469,30 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
                         diff = F.l1_loss(torch.diff(xr_rec, dim=-1), torch.diff(xb_ref, dim=-1))
                     else:
                         diff = torch.zeros((), device=device)
+                    if stft_loss_weight > 0.0:
+                        stft = stft_loss_fn(xr_rec, xb_ref)
+                    else:
+                        stft = torch.zeros((), device=device)
                     eval_mae_sum += mae
                     eval_diff_sum += diff
+                    eval_stft_sum += stft
                     eval_n += 1.0
 
             if world_size > 1 and dist.is_initialized():
                 dist.all_reduce(eval_mae_sum, op=dist.ReduceOp.SUM)
                 dist.all_reduce(eval_diff_sum, op=dist.ReduceOp.SUM)
+                dist.all_reduce(eval_stft_sum, op=dist.ReduceOp.SUM)
                 dist.all_reduce(eval_n, op=dist.ReduceOp.SUM)
 
             eval_mae = (eval_mae_sum / eval_n.clamp(min=1.0)).item()
             eval_diff = (eval_diff_sum / eval_n.clamp(min=1.0)).item()
+            eval_stft = (eval_stft_sum / eval_n.clamp(min=1.0)).item()
 
             if rank == 0:
                 if sw is not None:
                     sw.add_scalar("valid/mae", eval_mae, steps)
                     sw.add_scalar("valid/diff_l1", eval_diff, steps)
+                    sw.add_scalar("valid/stft_loss", eval_stft, steps)
 
                 # Checkpoint selection depends only on MAE.
                 score = -eval_mae

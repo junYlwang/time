@@ -77,7 +77,7 @@ final_div_factor: 100
 recon_smooth_l1_weight: 1.0
 smooth_l1_beta: 1.0
 diff_l1_weight: 1.0
-stft_loss_weight: 0.0
+stft_loss_weight: 1.0
 stft_win_sizes: [128, 256, 512]
 grad_clip_norm: 1.0
 quantizer_loss_weight: 1.0
