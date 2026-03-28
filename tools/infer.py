@@ -170,7 +170,7 @@ def _plot_sample(
     save_path: str,
     offset: int,
 ) -> None:
-    valid_len = int(max(1, min(valid_len, gt.shape[0], rec.shape[0], 100)))
+    valid_len = int(max(1, min(valid_len, gt.shape[0], rec.shape[0], 300)))
     x_start = int(offset) if int(offset) >= 0 else 0
     t = np.arange(valid_len) + x_start
 
