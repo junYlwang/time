@@ -1,5 +1,5 @@
 runs_root: runs
-exp_name: time-codec-rfsq-1000
+exp_name: time-codec-rfsq-1000-zscore-stft
 ddp_backend: nccl
 ddp_find_unused_parameters: false
 seed: 1234
@@ -10,6 +10,7 @@ train_split: train
 valid_split: valid
 normalization_method: null
 use_reversible_norm: true
+normalization_type: zscore
 revin_eps: 1.0e-5
 revin_affine: true
 revin_init_gamma: 1.0
@@ -81,6 +82,7 @@ stft_loss_weight: 1.0
 stft_win_sizes: [128, 256, 512]
 grad_clip_norm: 1.0
 quantizer_loss_weight: 1.0
+normalized_domain_loss_weight: 1.0
 
 stdout_interval: 100
 summary_interval: 100

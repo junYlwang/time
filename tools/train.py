@@ -33,7 +33,7 @@ from modules.encoder_wo_quantize import Encoder
 from modules.decoder import Decoder
 from modules.loss import MultiScaleLogMagSTFTLoss
 from modules.quantizer import build_quantizer
-from modules.revin import ReversibleInstanceNorm1D
+from modules.revin import ReversibleInstanceNorm1D, ReversibleMeanAbsNorm1D
 from modules.utils import load_hparams, build_env, load_checkpoint, save_checkpoint, get_state_dict
 from datasets.time_codec_dataset import SplitTimeSeriesCodecDataset
 
@@ -78,6 +78,31 @@ def _set_quantizer_mode(quantizer, stochastic: bool, temperature: float) -> None
 def _inverse_revin(norm_module, y: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
     mod = norm_module.module if hasattr(norm_module, "module") else norm_module
     return mod.inverse(y, mean, std)
+
+
+def _build_input_norm(h, device: torch.device):
+    norm_type = str(getattr(h, "normalization_type", "zscore")).lower()
+    if norm_type == "zscore":
+        mod = ReversibleInstanceNorm1D(
+            num_channels=int(getattr(h, "input_channels", 1)),
+            eps=float(getattr(h, "revin_eps", 1e-5)),
+            affine=bool(getattr(h, "revin_affine", True)),
+            init_gamma=float(getattr(h, "revin_init_gamma", 1.0)),
+            init_beta=float(getattr(h, "revin_init_beta", 0.0)),
+            positive_gamma=bool(getattr(h, "revin_positive_gamma", False)),
+        )
+    elif norm_type == "mean_abs":
+        mod = ReversibleMeanAbsNorm1D(
+            num_channels=int(getattr(h, "input_channels", 1)),
+            eps=float(getattr(h, "revin_eps", 1e-5)),
+            affine=bool(getattr(h, "revin_affine", True)),
+            init_gamma=float(getattr(h, "revin_init_gamma", 1.0)),
+            init_beta=float(getattr(h, "revin_init_beta", 0.0)),
+            positive_gamma=bool(getattr(h, "revin_positive_gamma", False)),
+        )
+    else:
+        raise ValueError(f"Unsupported normalization_type: {norm_type}. Expected one of: zscore, mean_abs")
+    return mod.to(device)
 
 
 def _update_codebook_coverage_masks(codes: torch.Tensor, mask_l1: torch.Tensor, mask_l2: torch.Tensor) -> None:
@@ -158,19 +183,16 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
     encoder = Encoder(h).to(device)
     quantizer = build_quantizer(h).to(device)
     decoder = Decoder(h).to(device)
-    input_norm = ReversibleInstanceNorm1D(
-        num_channels=int(getattr(h, "input_channels", 1)),
-        eps=float(getattr(h, "revin_eps", 1e-5)),
-        affine=bool(getattr(h, "revin_affine", True)),
-        init_gamma=float(getattr(h, "revin_init_gamma", 1.0)),
-        init_beta=float(getattr(h, "revin_init_beta", 0.0)),
-        positive_gamma=bool(getattr(h, "revin_positive_gamma", False)),
-    ).to(device)
+    input_norm = _build_input_norm(h, device)
     use_reversible_norm = bool(getattr(h, "use_reversible_norm", True))
 
     use_stochastic = bool(getattr(h, "stochastic", False))
     temp_steps = int(getattr(h, "temp_steps", 30000))
     quantizer_loss_weight = float(getattr(h, "quantizer_loss_weight", 1.0))
+    normalized_domain_loss_weight = float(getattr(h, "normalized_domain_loss_weight", 1.0))
+    recon_smooth_l1_weight = float(getattr(h, "recon_smooth_l1_weight", getattr(h, "recon_l1_weight", 1.0)))
+    diff_l1_weight = float(getattr(h, "diff_l1_weight", 1.0))
+    smooth_l1_beta = float(getattr(h, "smooth_l1_beta", 1.0))
     stft_loss_weight = float(getattr(h, "stft_loss_weight", 0.0))
     stft_win_sizes = list(getattr(h, "stft_win_sizes", [128, 256, 512]))
     stft_loss_fn = MultiScaleLogMagSTFTLoss(win_sizes=stft_win_sizes).to(device)
@@ -367,54 +389,92 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
         x_ref = x[..., :tmin]
         x_rec = x_hat[..., :tmin]
 
-        loss_smooth_l1 = F.smooth_l1_loss(
+        loss_raw_smooth_l1 = F.smooth_l1_loss(
             x_rec,
             x_ref,
-            beta=float(getattr(h, "smooth_l1_beta", 1.0)),
+            beta=smooth_l1_beta,
         )
         if tmin > 1:
-            loss_diff = F.l1_loss(torch.diff(x_rec, dim=-1), torch.diff(x_ref, dim=-1))
+            loss_raw_diff = F.l1_loss(torch.diff(x_rec, dim=-1), torch.diff(x_ref, dim=-1))
         else:
-            loss_diff = torch.zeros((), device=device)
+            loss_raw_diff = torch.zeros((), device=device)
         if stft_loss_weight > 0.0:
-            loss_stft = stft_loss_fn(x_rec, x_ref)
+            loss_raw_stft = stft_loss_fn(x_rec, x_ref)
         else:
-            loss_stft = torch.zeros((), device=device)
+            loss_raw_stft = torch.zeros((), device=device)
+
+        x_norm_ref = x_in[..., :tmin]
+        x_norm_rec = x_hat_norm[..., :tmin]
+        loss_norm_smooth_l1 = F.smooth_l1_loss(
+            x_norm_rec,
+            x_norm_ref,
+            beta=smooth_l1_beta,
+        )
+        if tmin > 1:
+            loss_norm_diff = F.l1_loss(torch.diff(x_norm_rec, dim=-1), torch.diff(x_norm_ref, dim=-1))
+        else:
+            loss_norm_diff = torch.zeros((), device=device)
+        if stft_loss_weight > 0.0:
+            loss_norm_stft = stft_loss_fn(x_norm_rec, x_norm_ref)
+        else:
+            loss_norm_stft = torch.zeros((), device=device)
+
+        loss_raw_total = (
+            recon_smooth_l1_weight * loss_raw_smooth_l1
+            + diff_l1_weight * loss_raw_diff
+            + stft_loss_weight * loss_raw_stft
+        )
+        loss_norm_total = (
+            recon_smooth_l1_weight * loss_norm_smooth_l1
+            + diff_l1_weight * loss_norm_diff
+            + stft_loss_weight * loss_norm_stft
+        )
 
         total_loss = (
-            float(getattr(h, "recon_smooth_l1_weight", getattr(h, "recon_l1_weight", 1.0))) * loss_smooth_l1
-            + float(h.diff_l1_weight) * loss_diff
-            + stft_loss_weight * loss_stft
+            loss_raw_total
+            + normalized_domain_loss_weight * loss_norm_total
             + quantizer_loss_weight * q_loss
         )
 
         total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(
-            itertools.chain(encoder.parameters(), quantizer.parameters(), decoder.parameters(), input_norm.parameters()),
-            max_norm=float(getattr(h, "grad_clip_norm", 1.0)),
-        )
+        # torch.nn.utils.clip_grad_norm_(
+        #     itertools.chain(encoder.parameters(), quantizer.parameters(), decoder.parameters(), input_norm.parameters()),
+        #     max_norm=float(getattr(h, "grad_clip_norm", 1.0)),
+        # )
         optim_g.step()
         scheduler.step()
 
         steps += 1
 
         log_total = reduce_mean(total_loss, world_size).item()
-        log_smooth_l1 = reduce_mean(loss_smooth_l1, world_size).item()
-        log_diff = reduce_mean(loss_diff, world_size).item()
-        log_stft = reduce_mean(loss_stft, world_size).item()
+        log_raw_total = reduce_mean(loss_raw_total, world_size).item()
+        log_raw_smooth_l1 = reduce_mean(loss_raw_smooth_l1, world_size).item()
+        log_raw_diff = reduce_mean(loss_raw_diff, world_size).item()
+        log_raw_stft = reduce_mean(loss_raw_stft, world_size).item()
+        log_norm_total = reduce_mean(loss_norm_total, world_size).item()
+        log_norm_smooth_l1 = reduce_mean(loss_norm_smooth_l1, world_size).item()
+        log_norm_diff = reduce_mean(loss_norm_diff, world_size).item()
+        log_norm_stft = reduce_mean(loss_norm_stft, world_size).item()
         log_q = reduce_mean(q_loss, world_size).item()
 
         if rank == 0 and steps % int(h.stdout_interval) == 0:
             print(
-                f"Steps: {steps} | Total: {log_total:.4f} | SmoothL1: {log_smooth_l1:.4f} | "
-                f"Diff: {log_diff:.4f} | STFT: {log_stft:.4f} | Q: {log_q:.4f} | s/b: {time.time() - start:.3f}"
+                f"Steps: {steps} | Total: {log_total:.4f} | "
+                f"Raw(S1:{log_raw_smooth_l1:.4f}, D:{log_raw_diff:.4f}, STFT:{log_raw_stft:.4f}, T:{log_raw_total:.4f}) | "
+                f"Norm(S1:{log_norm_smooth_l1:.4f}, D:{log_norm_diff:.4f}, STFT:{log_norm_stft:.4f}, T:{log_norm_total:.4f}) | "
+                f"Q: {log_q:.4f} | s/b: {time.time() - start:.3f}"
             )
 
         if rank == 0 and sw is not None and steps % int(h.summary_interval) == 0:
             sw.add_scalar("train/total_loss", log_total, steps)
-            sw.add_scalar("train/recon_smooth_l1", log_smooth_l1, steps)
-            sw.add_scalar("train/diff_l1", log_diff, steps)
-            sw.add_scalar("train/stft_loss", log_stft, steps)
+            sw.add_scalar("train/raw/total_loss", log_raw_total, steps)
+            sw.add_scalar("train/raw/smooth_l1_loss", log_raw_smooth_l1, steps)
+            sw.add_scalar("train/raw/diff_l1_loss", log_raw_diff, steps)
+            sw.add_scalar("train/raw/stft_loss", log_raw_stft, steps)
+            sw.add_scalar("train/norm/total_loss", log_norm_total, steps)
+            sw.add_scalar("train/norm/smooth_l1_loss", log_norm_smooth_l1, steps)
+            sw.add_scalar("train/norm/diff_l1_loss", log_norm_diff, steps)
+            sw.add_scalar("train/norm/stft_loss", log_norm_stft, steps)
             sw.add_scalar("train/quantizer_loss", log_q, steps)
             sw.add_scalar("train/lr", scheduler.get_last_lr()[0], steps)
 
@@ -446,8 +506,14 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
                 _set_quantizer_mode(quantizer, stochastic=False, temperature=0.3)
 
             eval_mae_sum = torch.zeros((), device=device)
-            eval_diff_sum = torch.zeros((), device=device)
-            eval_stft_sum = torch.zeros((), device=device)
+            eval_raw_total_sum = torch.zeros((), device=device)
+            eval_raw_smooth_l1_sum = torch.zeros((), device=device)
+            eval_raw_diff_sum = torch.zeros((), device=device)
+            eval_raw_stft_sum = torch.zeros((), device=device)
+            eval_norm_total_sum = torch.zeros((), device=device)
+            eval_norm_smooth_l1_sum = torch.zeros((), device=device)
+            eval_norm_diff_sum = torch.zeros((), device=device)
+            eval_norm_stft_sum = torch.zeros((), device=device)
             eval_n = torch.zeros((), device=device)
 
             with torch.no_grad():
@@ -465,34 +531,76 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
                     xb_ref = xb[..., :tmin]
                     xr_rec = xr[..., :tmin]
                     mae = F.l1_loss(xr_rec, xb_ref)
+                    xr_norm_rec = xr_norm[..., :tmin]
+                    xb_norm_ref = xb_in[..., :tmin]
+                    raw_smooth_l1 = F.smooth_l1_loss(xr_rec, xb_ref, beta=smooth_l1_beta)
+                    norm_smooth_l1 = F.smooth_l1_loss(xr_norm_rec, xb_norm_ref, beta=smooth_l1_beta)
                     if tmin > 1:
-                        diff = F.l1_loss(torch.diff(xr_rec, dim=-1), torch.diff(xb_ref, dim=-1))
+                        raw_diff = F.l1_loss(torch.diff(xr_rec, dim=-1), torch.diff(xb_ref, dim=-1))
+                        norm_diff = F.l1_loss(torch.diff(xr_norm_rec, dim=-1), torch.diff(xb_norm_ref, dim=-1))
                     else:
-                        diff = torch.zeros((), device=device)
+                        raw_diff = torch.zeros((), device=device)
+                        norm_diff = torch.zeros((), device=device)
                     if stft_loss_weight > 0.0:
-                        stft = stft_loss_fn(xr_rec, xb_ref)
+                        raw_stft = stft_loss_fn(xr_rec, xb_ref)
+                        norm_stft = stft_loss_fn(xr_norm_rec, xb_norm_ref)
                     else:
-                        stft = torch.zeros((), device=device)
+                        raw_stft = torch.zeros((), device=device)
+                        norm_stft = torch.zeros((), device=device)
+                    raw_total = (
+                        recon_smooth_l1_weight * raw_smooth_l1
+                        + diff_l1_weight * raw_diff
+                        + stft_loss_weight * raw_stft
+                    )
+                    norm_total = (
+                        recon_smooth_l1_weight * norm_smooth_l1
+                        + diff_l1_weight * norm_diff
+                        + stft_loss_weight * norm_stft
+                    )
                     eval_mae_sum += mae
-                    eval_diff_sum += diff
-                    eval_stft_sum += stft
+                    eval_raw_total_sum += raw_total
+                    eval_raw_smooth_l1_sum += raw_smooth_l1
+                    eval_raw_diff_sum += raw_diff
+                    eval_raw_stft_sum += raw_stft
+                    eval_norm_total_sum += norm_total
+                    eval_norm_smooth_l1_sum += norm_smooth_l1
+                    eval_norm_diff_sum += norm_diff
+                    eval_norm_stft_sum += norm_stft
                     eval_n += 1.0
 
             if world_size > 1 and dist.is_initialized():
                 dist.all_reduce(eval_mae_sum, op=dist.ReduceOp.SUM)
-                dist.all_reduce(eval_diff_sum, op=dist.ReduceOp.SUM)
-                dist.all_reduce(eval_stft_sum, op=dist.ReduceOp.SUM)
+                dist.all_reduce(eval_raw_total_sum, op=dist.ReduceOp.SUM)
+                dist.all_reduce(eval_raw_smooth_l1_sum, op=dist.ReduceOp.SUM)
+                dist.all_reduce(eval_raw_diff_sum, op=dist.ReduceOp.SUM)
+                dist.all_reduce(eval_raw_stft_sum, op=dist.ReduceOp.SUM)
+                dist.all_reduce(eval_norm_total_sum, op=dist.ReduceOp.SUM)
+                dist.all_reduce(eval_norm_smooth_l1_sum, op=dist.ReduceOp.SUM)
+                dist.all_reduce(eval_norm_diff_sum, op=dist.ReduceOp.SUM)
+                dist.all_reduce(eval_norm_stft_sum, op=dist.ReduceOp.SUM)
                 dist.all_reduce(eval_n, op=dist.ReduceOp.SUM)
 
             eval_mae = (eval_mae_sum / eval_n.clamp(min=1.0)).item()
-            eval_diff = (eval_diff_sum / eval_n.clamp(min=1.0)).item()
-            eval_stft = (eval_stft_sum / eval_n.clamp(min=1.0)).item()
+            eval_raw_total = (eval_raw_total_sum / eval_n.clamp(min=1.0)).item()
+            eval_raw_smooth_l1 = (eval_raw_smooth_l1_sum / eval_n.clamp(min=1.0)).item()
+            eval_raw_diff = (eval_raw_diff_sum / eval_n.clamp(min=1.0)).item()
+            eval_raw_stft = (eval_raw_stft_sum / eval_n.clamp(min=1.0)).item()
+            eval_norm_total = (eval_norm_total_sum / eval_n.clamp(min=1.0)).item()
+            eval_norm_smooth_l1 = (eval_norm_smooth_l1_sum / eval_n.clamp(min=1.0)).item()
+            eval_norm_diff = (eval_norm_diff_sum / eval_n.clamp(min=1.0)).item()
+            eval_norm_stft = (eval_norm_stft_sum / eval_n.clamp(min=1.0)).item()
 
             if rank == 0:
                 if sw is not None:
                     sw.add_scalar("valid/mae", eval_mae, steps)
-                    sw.add_scalar("valid/diff_l1", eval_diff, steps)
-                    sw.add_scalar("valid/stft_loss", eval_stft, steps)
+                    sw.add_scalar("valid/raw/total_loss", eval_raw_total, steps)
+                    sw.add_scalar("valid/raw/smooth_l1_loss", eval_raw_smooth_l1, steps)
+                    sw.add_scalar("valid/raw/diff_l1_loss", eval_raw_diff, steps)
+                    sw.add_scalar("valid/raw/stft_loss", eval_raw_stft, steps)
+                    sw.add_scalar("valid/norm/total_loss", eval_norm_total, steps)
+                    sw.add_scalar("valid/norm/smooth_l1_loss", eval_norm_smooth_l1, steps)
+                    sw.add_scalar("valid/norm/diff_l1_loss", eval_norm_diff, steps)
+                    sw.add_scalar("valid/norm/stft_loss", eval_norm_stft, steps)
 
                 # Checkpoint selection depends only on MAE.
                 score = -eval_mae

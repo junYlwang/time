@@ -27,7 +27,7 @@ from datasets.time_moe_dataset import TimeMoEDataset
 from modules.decoder import Decoder
 from modules.encoder_wo_quantize import Encoder
 from modules.quantizer import build_quantizer
-from modules.revin import ReversibleInstanceNorm1D
+from modules.revin import ReversibleInstanceNorm1D, ReversibleMeanAbsNorm1D
 from modules.utils import load_checkpoint, load_hparams
 
 
@@ -47,6 +47,31 @@ def _set_seed(seed: int) -> None:
 
 def _inverse_revin(norm_module, y: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
     return norm_module.inverse(y, mean, std)
+
+
+def _build_input_norm(h, device: torch.device):
+    norm_type = str(getattr(h, "normalization_type", "zscore")).lower()
+    if norm_type == "zscore":
+        mod = ReversibleInstanceNorm1D(
+            num_channels=int(getattr(h, "input_channels", 1)),
+            eps=float(getattr(h, "revin_eps", 1e-5)),
+            affine=bool(getattr(h, "revin_affine", True)),
+            init_gamma=float(getattr(h, "revin_init_gamma", 1.0)),
+            init_beta=float(getattr(h, "revin_init_beta", 0.0)),
+            positive_gamma=bool(getattr(h, "revin_positive_gamma", False)),
+        )
+    elif norm_type == "mean_abs":
+        mod = ReversibleMeanAbsNorm1D(
+            num_channels=int(getattr(h, "input_channels", 1)),
+            eps=float(getattr(h, "revin_eps", 1e-5)),
+            affine=bool(getattr(h, "revin_affine", True)),
+            init_gamma=float(getattr(h, "revin_init_gamma", 1.0)),
+            init_beta=float(getattr(h, "revin_init_beta", 0.0)),
+            positive_gamma=bool(getattr(h, "revin_positive_gamma", False)),
+        )
+    else:
+        raise ValueError(f"Unsupported normalization_type: {norm_type}. Expected one of: zscore, mean_abs")
+    return mod.to(device)
 
 
 def _set_quantizer_eval_mode(quantizer) -> None:
@@ -191,14 +216,7 @@ def _build_models(h, device: torch.device):
     encoder = Encoder(h).to(device)
     quantizer = build_quantizer(h).to(device)
     decoder = Decoder(h).to(device)
-    input_norm = ReversibleInstanceNorm1D(
-        num_channels=int(getattr(h, "input_channels", 1)),
-        eps=float(getattr(h, "revin_eps", 1e-5)),
-        affine=bool(getattr(h, "revin_affine", True)),
-        init_gamma=float(getattr(h, "revin_init_gamma", 1.0)),
-        init_beta=float(getattr(h, "revin_init_beta", 0.0)),
-        positive_gamma=bool(getattr(h, "revin_positive_gamma", False)),
-    ).to(device)
+    input_norm = _build_input_norm(h, device)
     return encoder, quantizer, decoder, input_norm
 
 
