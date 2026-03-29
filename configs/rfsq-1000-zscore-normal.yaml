@@ -1,5 +1,5 @@
 runs_root: runs
-exp_name: time-codec-rfsq-1000-zscore
+exp_name: time-codec-rfsq-1000-zscore-normal
 ddp_backend: nccl
 ddp_find_unused_parameters: false
 seed: 1234
@@ -78,7 +78,7 @@ final_div_factor: 100
 smooth_l1_beta: 1.0
 stft_win_sizes: [128, 256, 512]
 raw_domain_loss_weight: 1.0
-norm_domain_loss_weight: 0.0
+norm_domain_loss_weight: 1000.0
 raw_smooth_l1_weight: 1.0
 raw_diff_l1_weight: 2.0
 raw_stft_loss_weight: 0.0

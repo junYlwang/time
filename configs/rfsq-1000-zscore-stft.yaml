@@ -78,12 +78,12 @@ final_div_factor: 100
 smooth_l1_beta: 1.0
 stft_win_sizes: [128, 256, 512]
 raw_domain_loss_weight: 1.0
-norm_domain_loss_weight: 1.0
+norm_domain_loss_weight: 0.0
 raw_smooth_l1_weight: 1.0
-raw_diff_l1_weight: 1.0
-raw_stft_loss_weight: 1.0
-norm_smooth_l1_weight: 1.0
-norm_diff_l1_weight: 1.0
+raw_diff_l1_weight: 2.0
+raw_stft_loss_weight: 500.0
+norm_smooth_l1_weight: 2.0
+norm_diff_l1_weight: 2.0
 norm_stft_loss_weight: 1.0
 grad_clip_norm: 1.0
 quantizer_loss_weight: 1.0

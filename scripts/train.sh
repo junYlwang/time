@@ -1,9 +1,9 @@
 GPU=1
 CPU=$((GPU * 8))
 MEMORY=$((GPU * 160000))
-rjob delete time-codec-rfsq-1000
+rjob delete time-codec-rfsq-1000-zscore-stft
 rjob submit \
-  --name=time-codec-rfsq-1000 \
+  --name=time-codec-rfsq-1000-zscore-stft \
   --gpu=$GPU \
   --cpu=$CPU \
   --memory=$MEMORY \
@@ -20,5 +20,5 @@ set -ex
 cd /mnt/shared-storage-gpfs2/brainllm2-share/junyi/time
 conda activate time
 python -m tools.train \
---config /mnt/shared-storage-gpfs2/brainllm2-share/junyi/time/configs/time-codec-rfsq-1000.yaml
+--config /mnt/shared-storage-gpfs2/brainllm2-share/junyi/time/configs/rfsq-1000-zscore-stft.yaml
 '
