@@ -189,11 +189,15 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
     use_stochastic = bool(getattr(h, "stochastic", False))
     temp_steps = int(getattr(h, "temp_steps", 30000))
     quantizer_loss_weight = float(getattr(h, "quantizer_loss_weight", 1.0))
-    normalized_domain_loss_weight = float(getattr(h, "normalized_domain_loss_weight", 1.0))
-    recon_smooth_l1_weight = float(getattr(h, "recon_smooth_l1_weight", getattr(h, "recon_l1_weight", 1.0)))
-    diff_l1_weight = float(getattr(h, "diff_l1_weight", 1.0))
+    raw_domain_loss_weight = float(getattr(h, "raw_domain_loss_weight", 1.0))
+    norm_domain_loss_weight = float(getattr(h, "norm_domain_loss_weight", 1.0))
+    raw_smooth_l1_weight = float(getattr(h, "raw_smooth_l1_weight", 1.0))
+    raw_diff_l1_weight = float(getattr(h, "raw_diff_l1_weight", 1.0))
+    raw_stft_loss_weight = float(getattr(h, "raw_stft_loss_weight", 1.0))
+    norm_smooth_l1_weight = float(getattr(h, "norm_smooth_l1_weight", 1.0))
+    norm_diff_l1_weight = float(getattr(h, "norm_diff_l1_weight", 1.0))
+    norm_stft_loss_weight = float(getattr(h, "norm_stft_loss_weight", 1.0))
     smooth_l1_beta = float(getattr(h, "smooth_l1_beta", 1.0))
-    stft_loss_weight = float(getattr(h, "stft_loss_weight", 0.0))
     stft_win_sizes = list(getattr(h, "stft_win_sizes", [128, 256, 512]))
     stft_loss_fn = MultiScaleLogMagSTFTLoss(win_sizes=stft_win_sizes).to(device)
     coverage_interval = max(1, int(getattr(h, "codebook_coverage_interval", getattr(h, "summary_interval", 1000))))
@@ -398,7 +402,7 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
             loss_raw_diff = F.l1_loss(torch.diff(x_rec, dim=-1), torch.diff(x_ref, dim=-1))
         else:
             loss_raw_diff = torch.zeros((), device=device)
-        if stft_loss_weight > 0.0:
+        if raw_stft_loss_weight > 0.0:
             loss_raw_stft = stft_loss_fn(x_rec, x_ref)
         else:
             loss_raw_stft = torch.zeros((), device=device)
@@ -414,25 +418,25 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
             loss_norm_diff = F.l1_loss(torch.diff(x_norm_rec, dim=-1), torch.diff(x_norm_ref, dim=-1))
         else:
             loss_norm_diff = torch.zeros((), device=device)
-        if stft_loss_weight > 0.0:
+        if norm_stft_loss_weight > 0.0:
             loss_norm_stft = stft_loss_fn(x_norm_rec, x_norm_ref)
         else:
             loss_norm_stft = torch.zeros((), device=device)
 
         loss_raw_total = (
-            recon_smooth_l1_weight * loss_raw_smooth_l1
-            + diff_l1_weight * loss_raw_diff
-            + stft_loss_weight * loss_raw_stft
+            raw_smooth_l1_weight * loss_raw_smooth_l1
+            + raw_diff_l1_weight * loss_raw_diff
+            + raw_stft_loss_weight * loss_raw_stft
         )
         loss_norm_total = (
-            recon_smooth_l1_weight * loss_norm_smooth_l1
-            + diff_l1_weight * loss_norm_diff
-            + stft_loss_weight * loss_norm_stft
+            norm_smooth_l1_weight * loss_norm_smooth_l1
+            + norm_diff_l1_weight * loss_norm_diff
+            + norm_stft_loss_weight * loss_norm_stft
         )
 
         total_loss = (
-            loss_raw_total
-            + normalized_domain_loss_weight * loss_norm_total
+            raw_domain_loss_weight * loss_raw_total
+            + norm_domain_loss_weight * loss_norm_total
             + quantizer_loss_weight * q_loss
         )
 
@@ -541,21 +545,23 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
                     else:
                         raw_diff = torch.zeros((), device=device)
                         norm_diff = torch.zeros((), device=device)
-                    if stft_loss_weight > 0.0:
+                    if raw_stft_loss_weight > 0.0:
                         raw_stft = stft_loss_fn(xr_rec, xb_ref)
-                        norm_stft = stft_loss_fn(xr_norm_rec, xb_norm_ref)
                     else:
                         raw_stft = torch.zeros((), device=device)
+                    if norm_stft_loss_weight > 0.0:
+                        norm_stft = stft_loss_fn(xr_norm_rec, xb_norm_ref)
+                    else:
                         norm_stft = torch.zeros((), device=device)
                     raw_total = (
-                        recon_smooth_l1_weight * raw_smooth_l1
-                        + diff_l1_weight * raw_diff
-                        + stft_loss_weight * raw_stft
+                        raw_smooth_l1_weight * raw_smooth_l1
+                        + raw_diff_l1_weight * raw_diff
+                        + raw_stft_loss_weight * raw_stft
                     )
                     norm_total = (
-                        recon_smooth_l1_weight * norm_smooth_l1
-                        + diff_l1_weight * norm_diff
-                        + stft_loss_weight * norm_stft
+                        norm_smooth_l1_weight * norm_smooth_l1
+                        + norm_diff_l1_weight * norm_diff
+                        + norm_stft_loss_weight * norm_stft
                     )
                     eval_mae_sum += mae
                     eval_raw_total_sum += raw_total
