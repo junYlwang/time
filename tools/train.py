@@ -83,6 +83,7 @@ def _inverse_revin(norm_module, y: torch.Tensor, mean: torch.Tensor, std: torch.
 def _build_input_norm(h, device: torch.device):
     norm_type = str(getattr(h, "normalization_type", "zscore")).lower()
     if norm_type == "zscore":
+        print("use zscore normalization")
         mod = ReversibleInstanceNorm1D(
             num_channels=int(getattr(h, "input_channels", 1)),
             eps=float(getattr(h, "revin_eps", 1e-5)),
@@ -92,6 +93,7 @@ def _build_input_norm(h, device: torch.device):
             positive_gamma=bool(getattr(h, "revin_positive_gamma", False)),
         )
     elif norm_type == "mean_abs":
+        print("use mean_abs normalization")
         mod = ReversibleMeanAbsNorm1D(
             num_channels=int(getattr(h, "input_channels", 1)),
             eps=float(getattr(h, "revin_eps", 1e-5)),

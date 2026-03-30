@@ -107,16 +107,19 @@ class ReversibleMeanAbsNorm1D(nn.Module):
             return F.softplus(self.gamma_raw)
         return self.gamma
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if x.ndim != 3:
             raise ValueError(f"Expected [B, C, T], got shape={tuple(x.shape)}")
         scale = x.abs().mean(dim=-1, keepdim=True) + self.eps
         y = x / scale
         if self.affine:
             y = y * self._get_gamma() + self.beta
-        return y, scale
+        # Keep the same 3-value interface as ReversibleInstanceNorm1D:
+        # return (normalized, stat_1, stat_2)
+        dummy_mean = torch.zeros_like(scale)
+        return y, dummy_mean, scale
 
-    def inverse(self, y: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    def inverse(self, y: torch.Tensor, _dummy_mean: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
         if self.affine:
             y = (y - self.beta) / (self._get_gamma() + self.eps)
         return y * scale
