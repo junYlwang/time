@@ -96,6 +96,6 @@ validation_interval: 1000
 # Inference
 inference:
   test_split: test
-  checkpoint_path: /mnt/shared-storage-gpfs2/brainllm2-share/junyi/time/runs/time-codec-rfsq-1000/2026-03-24_17-55-58__seed1234__gpu1/checkpoints/codec_steps=00319000_score=-2.6833
-  output_dir: /mnt/shared-storage-gpfs2/brainllm2-share/junyi/time/runs/time-codec-rfsq-1000/2026-03-24_17-55-58__seed1234__gpu1
+  checkpoint_path: /mnt/shared-storage-gpfs2/brainllm2-share/junyi/time/runs/time-codec-rfsq-1000-zscore-stft-normal/2026-03-30_03-09-44__seed1234__gpu1/checkpoints/codec_steps=00200000_score=-0.9781
+  output_dir: /mnt/shared-storage-gpfs2/brainllm2-share/junyi/time/runs/time-codec-rfsq-1000-zscore-stft-normal/2026-03-30_03-09-44__seed1234__gpu1/test_200k
   num_visual_samples: 3
