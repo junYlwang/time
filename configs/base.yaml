@@ -1,0 +1,15 @@
+split_manifest_path: /mnt/shared-storage-gpfs2/brainllm2-share/junyi/time/configs/data_v0.json
+test_split: test
+normalization_method: null
+
+decomposition:
+  num_channels: 1
+  kernel_sizes: [15, 31, 63, 127, 255]
+  weight_mode: uniform
+  summary_length: 32
+  gating_hidden_dim: 64
+
+decomposition_test:
+  plot_length: 2048
+  output_dir: /mnt/shared-storage-gpfs2/brainllm2-share/junyi/time
+  max_samples_per_subset: -1
