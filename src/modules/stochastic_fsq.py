@@ -189,7 +189,7 @@ class FSQ(Module):
 
             if self.preserve_symmetry:
                 upper_bound = (self._levels - 1).view(1, 1, -1, 1) # [1, 1, D, 1]
-                lower_bound = torch.zero_like(upper_bound)
+                lower_bound = torch.zeros_like(upper_bound)
             else:
                 upper_bound = ((self._levels - 1) // 2).view(1, 1, -1, 1)
                 lower_bound = (-(self._levels // 2)).view(1, 1, -1, 1)
@@ -442,7 +442,7 @@ class IFSQ(Module):
 
             if self.preserve_symmetry:
                 upper_bound = (self._levels - 1).view(1, 1, -1, 1) # [1, 1, D, 1]
-                lower_bound = torch.zero_like(upper_bound)
+                lower_bound = torch.zeros_like(upper_bound)
             else:
                 upper_bound = ((self._levels - 1) // 2).view(1, 1, -1, 1)
                 lower_bound = (-(self._levels // 2)).view(1, 1, -1, 1)
@@ -596,6 +596,79 @@ class IFSQ(Module):
             indices = maybe(rearrange)(indices, '... 1 -> ...')
 
         return out, indices
+
+
+class RFSQ(Module):
+    def __init__(
+        self,
+        levels: list[int] | tuple[int, ...],
+        dim: int | None = None,
+        num_quantizers: int = 2,
+        channel_first = False,
+        projection_has_bias = True,
+        return_indices = True,
+        force_quantization_f32 = True,
+        preserve_symmetry = False,
+        noise_dropout = 0.,
+        temperature: float = 1.0,
+        stochastic: bool = False,
+    ):
+        super().__init__()
+        assert num_quantizers >= 1, 'num_quantizers must be at least 1'
+
+        self.num_quantizers = num_quantizers
+        self.layers = nn.ModuleList([
+            IFSQ(
+                levels=levels,
+                dim=dim,
+                channel_first=channel_first,
+                projection_has_bias=projection_has_bias,
+                return_indices=return_indices,
+                force_quantization_f32=force_quantization_f32,
+                preserve_symmetry=preserve_symmetry,
+                noise_dropout=noise_dropout,
+                temperature=temperature,
+                stochastic=stochastic,
+            )
+            for _ in range(num_quantizers)
+        ])
+        self.saved_log_probs = None
+
+    @property
+    def codebook_size(self):
+        return self.layers[0].codebook_size
+
+    def set_temperature(self, temperature: float):
+        for layer in self.layers:
+            layer.set_temperature(temperature)
+
+    def set_stochastic(self, active: bool):
+        for layer in self.layers:
+            layer.set_stochastic(active)
+
+    def forward(self, x):
+        quantized_out = torch.zeros_like(x)
+        residual = x
+        all_indices = []
+        all_log_probs = []
+
+        for layer in self.layers:
+            quantized, indices = layer(residual)
+            residual = residual - quantized.detach()
+            quantized_out = quantized_out + quantized
+
+            if exists(indices):
+                all_indices.append(indices)
+
+            if exists(layer.saved_log_probs):
+                all_log_probs.append(layer.saved_log_probs)
+
+        indices = None
+        if all_indices:
+            indices = torch.stack(all_indices, dim=1)
+
+        self.saved_log_probs = all_log_probs if all_log_probs else None
+        return quantized_out, indices
 
 # --- Example Usage for your RL Loop ---
 if __name__ == "__main__":

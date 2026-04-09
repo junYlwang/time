@@ -1,0 +1,124 @@
+runs_root: runs
+exp_name: dual-rvq-data-v0
+ddp_backend: nccl
+ddp_find_unused_parameters: false
+seed: 1234
+
+# Data
+split_manifest_path: /mnt/shared-storage-gpfs2/brainllm2-share/junyi/time/configs/data_v0.json
+train_split: train
+valid_split: valid
+normalization_method: null
+use_reversible_norm: true
+normalization_type: zscore
+revin_eps: 1.0e-5
+revin_affine: true
+revin_init_gamma: 1.0
+revin_init_beta: 0.0
+revin_positive_gamma: false
+resume_skip_seen_batches: true
+keep_topk: 3
+
+# Segment sampling
+train_segment_length: 2048
+eval_segment_length: 2048
+samples_per_epoch: 376870
+max_valid_sequences: 5000
+
+# Shared model hyperparameters
+input_channels: 1
+output_channels: 1
+
+encoder_in_dim: 32
+encoder_num_layers: [2, 3, 4]
+down_ratio: [2, 2, 2]
+encoder_embed_kernel_size: 11
+
+seq_encoder_channel: 128
+seq_encoder_downsample_kernel_size: [6, 6, 6]
+seq_encoder_output_kernel_size: 11
+latent_output_conv_kernel_size: 11
+latent_dim: 16
+
+decoder_base_dim: 32
+decoder_num_layers: [4, 3, 2]
+up_ratio: [2, 2, 2]
+latent_input_conv_kernel_size: 11
+
+seq_decoder_channel: 128
+seq_decoder_input_kernel_size: 11
+seq_decoder_convnext_kernel_size: [6, 6, 6]
+seq_decoder_output_conv_kernel_size: 11
+
+# Decomposition
+decomposition:
+  num_channels: 1
+  kernel_sizes: [15, 31, 63, 127, 255]
+  weight_mode: dynamic
+  summary_length: 32
+  gating_hidden_dim: 64
+
+# Trend quantizer
+trend_quantizer_type: rvq
+trend_stochastic: false
+trend_num_quantizers: 1
+trend_levels_1: [8, 4, 4, 4]
+trend_levels_2: [8, 4, 4, 4]
+trend_rvq_codebook_size: 1024
+trend_rvq_codebook_dim: 8
+trend_rvq_decay: 0.99
+trend_rvq_quantize_dropout: false
+trend_rvq_quantize_dropout_cutoff_index: 0
+
+# Residual quantizer
+residual_quantizer_type: rvq
+residual_stochastic: false
+residual_num_quantizers: 1
+residual_levels_1: [8, 5, 5, 5]
+residual_levels_2: [8, 5, 5, 5]
+residual_rvq_codebook_size: 2048
+residual_rvq_codebook_dim: 8
+residual_rvq_decay: 0.99
+residual_rvq_quantize_dropout: false
+residual_rvq_quantize_dropout_cutoff_index: 0
+
+# Optimization
+train_batch_size: 1024
+eval_batch_size: 1024
+num_workers: 4
+learning_rate: 0.001
+adam_b1: 0.8
+adam_b2: 0.9
+max_training_steps: 200000
+
+pct_start: 0.05
+div_factor: 25
+final_div_factor: 100
+
+smooth_l1_beta: 1.0
+stft_win_sizes: [128, 256, 512]
+raw_domain_loss_weight: 1.0
+norm_domain_loss_weight: 5.0
+raw_smooth_l1_weight: 1.0
+raw_diff_l1_weight: 1.0
+raw_stft_loss_weight: 2.0
+norm_smooth_l1_weight: 10.0
+norm_diff_l1_weight: 1.0
+norm_stft_loss_weight: 1.0
+trend_loss_weight: 10.0
+residual_loss_weight: 1.0
+quantizer_loss_weight: 20.0
+temp_steps: 30000
+grad_clip_norm: 1.0
+
+stdout_interval: 100
+summary_interval: 100
+codebook_coverage_interval: 1000
+validation_interval: 1000
+
+# Inference
+inference:
+  test_split: test
+  checkpoint_path: /path/to/dual_codec_checkpoint
+  output_dir: /mnt/shared-storage-gpfs2/brainllm2-share/junyi/time/runs/dual-codec-rfsq-zscore/debug_infer
+  num_visual_samples: 3

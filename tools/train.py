@@ -107,15 +107,16 @@ def _build_input_norm(h, device: torch.device):
     return mod.to(device)
 
 
-def _update_codebook_coverage_masks(codes: torch.Tensor, mask_l1: torch.Tensor, mask_l2: torch.Tensor) -> None:
-    # codes: [B, Q, T], where Q=2 for two residual quantizers.
-    if codes.dim() != 3 or codes.size(1) < 2:
-        raise ValueError(f"Expected codes with shape [B, Q, T] and Q>=2, got {tuple(codes.shape)}")
-
-    idx_l1 = codes[:, 0, :].detach().reshape(-1).long().clamp_(0, mask_l1.numel() - 1)
-    idx_l2 = codes[:, 1, :].detach().reshape(-1).long().clamp_(0, mask_l2.numel() - 1)
-    mask_l1[idx_l1] = True
-    mask_l2[idx_l2] = True
+def _update_codebook_coverage_masks(codes: torch.Tensor, masks: list[torch.Tensor]) -> None:
+    if codes.dim() != 3:
+        raise ValueError(f"Expected codes with shape [B, Q, T], got {tuple(codes.shape)}")
+    if codes.size(1) != len(masks):
+        raise ValueError(
+            f"Mismatch between code layers ({codes.size(1)}) and coverage masks ({len(masks)})"
+        )
+    for level_idx, mask in enumerate(masks):
+        indices = codes[:, level_idx, :].detach().reshape(-1).long().clamp_(0, mask.numel() - 1)
+        mask[indices] = True
 
 
 def _compute_global_codebook_coverage(mask: torch.Tensor, world_size: int) -> float:
@@ -124,6 +125,13 @@ def _compute_global_codebook_coverage(mask: torch.Tensor, world_size: int) -> fl
         dist.all_reduce(global_mask, op=dist.ReduceOp.MAX)
     used = (global_mask > 0.5).sum().item()
     return float(used / max(1, global_mask.numel()))
+
+
+def _init_coverage_masks(codebook_sizes, device: torch.device) -> list[torch.Tensor]:
+    return [
+        torch.zeros(int(size), device=device, dtype=torch.bool)
+        for size in tuple(codebook_sizes)
+    ]
 
 
 def _load_topk(path: str):
@@ -325,12 +333,7 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
 
     quantizer_for_cov = quantizer.module if hasattr(quantizer, "module") else quantizer
     codebook_sizes = tuple(getattr(quantizer_for_cov, "codebook_sizes", ()))
-    if len(codebook_sizes) >= 2:
-        used_indices_mask_1 = torch.zeros(int(codebook_sizes[0]), device=device, dtype=torch.bool)
-        used_indices_mask_2 = torch.zeros(int(codebook_sizes[1]), device=device, dtype=torch.bool)
-    else:
-        used_indices_mask_1 = None
-        used_indices_mask_2 = None
+    coverage_masks = _init_coverage_masks(codebook_sizes, device)
 
     steps_per_epoch = max(1, len(train_loader))
     current_epoch = steps // steps_per_epoch
@@ -385,9 +388,9 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
         z_q = quant_out.z_q
         _codes = quant_out.codes
         q_loss = quant_out.q_loss
-        if _codes is not None and used_indices_mask_1 is not None and used_indices_mask_2 is not None:
+        if _codes is not None and coverage_masks:
             with torch.no_grad():
-                _update_codebook_coverage_masks(_codes, used_indices_mask_1, used_indices_mask_2)
+                _update_codebook_coverage_masks(_codes, coverage_masks)
         x_hat_norm = decoder(z_q)
         x_hat = _inverse_revin(input_norm, x_hat_norm, mu, std) if use_reversible_norm else x_hat_norm
 
@@ -486,21 +489,23 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
 
         if (
             steps % coverage_interval == 0
-            and used_indices_mask_1 is not None
-            and used_indices_mask_2 is not None
+            and coverage_masks
         ):
-            coverage_l1 = _compute_global_codebook_coverage(used_indices_mask_1, world_size)
-            coverage_l2 = _compute_global_codebook_coverage(used_indices_mask_2, world_size)
+            coverages = [
+                _compute_global_codebook_coverage(mask, world_size)
+                for mask in coverage_masks
+            ]
             if rank == 0:
                 if sw is not None:
-                    sw.add_scalar("train/codebook_coverage_l1", coverage_l1, steps)
-                    sw.add_scalar("train/codebook_coverage_l2", coverage_l2, steps)
-                print(
-                    f"Steps: {steps} | Codebook Coverage L1: {coverage_l1:.4f} | "
-                    f"Codebook Coverage L2: {coverage_l2:.4f}"
+                    for level_idx, coverage in enumerate(coverages, start=1):
+                        sw.add_scalar(f"train/codebook_coverage_l{level_idx}", coverage, steps)
+                coverage_msg = " | ".join(
+                    f"Codebook Coverage L{level_idx}: {coverage:.4f}"
+                    for level_idx, coverage in enumerate(coverages, start=1)
                 )
-            used_indices_mask_1.zero_()
-            used_indices_mask_2.zero_()
+                print(f"Steps: {steps} | {coverage_msg}")
+            for mask in coverage_masks:
+                mask.zero_()
 
         if steps % int(h.validation_interval) == 0:
             encoder.eval()

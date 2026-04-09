@@ -7,41 +7,8 @@ from torch.nn import Conv1d
 from torch.nn.utils import weight_norm
 
 from .backbones import ConvNeXtBlock, DownSamplingBlock
-from .stochastic_fsq import IFSQ
+from .stochastic_fsq import RFSQ
 from .utils import get_padding, init_weights
-
-
-class InvertibleLayerNorm(nn.Module):
-    """Invertible LayerNorm for (B, D, T)."""
-
-    def __init__(self, num_dims: int, eps: float = 1e-5):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(num_dims))
-        self.bias = nn.Parameter(torch.zeros(num_dims))
-
-        self.register_buffer("current_mean", None, persistent=False)
-        self.register_buffer("current_std", None, persistent=False)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        b, d, _t = x.shape
-        self.current_mean = x.mean(dim=1, keepdim=True)
-        var = x.var(dim=1, keepdim=True, unbiased=False)
-        self.current_std = torch.sqrt(var + self.eps)
-
-        y = (x - self.current_mean) / self.current_std
-        w = self.weight.view(1, d, 1)
-        b0 = self.bias.view(1, d, 1)
-        return y * w + b0
-
-    def inverse(self, y: torch.Tensor) -> torch.Tensor:
-        if self.current_mean is None or self.current_std is None:
-            raise RuntimeError("Call forward() before inverse().")
-        _b, d, _t = y.shape
-        w = self.weight.view(1, d, 1)
-        b0 = self.bias.view(1, d, 1)
-        x = (y - b0) / w
-        return x * self.current_std + self.current_mean
 
 
 class Encoder(nn.Module):
@@ -95,13 +62,14 @@ class Encoder(nn.Module):
         self.latent_conv.apply(init_weights)
 
         self.num_quantizers = int(getattr(h, "num_quantizers", 2))
-        levels_1 = getattr(h, "levels_1", [8, 5, 5, 5])
-        self.quantizer_1 = IFSQ(levels=levels_1, dim=latent_dim, channel_first=True, stochastic=bool(getattr(h, "stochastic", False)))
-        self.layernorm_1 = InvertibleLayerNorm(latent_dim)
-
-        levels_2 = getattr(h, "levels_2", [8, 5, 5, 5])
-        self.quantizer_2 = IFSQ(levels=levels_2, dim=latent_dim, channel_first=True, stochastic=bool(getattr(h, "stochastic", False)))
-        self.layernorm_2 = InvertibleLayerNorm(latent_dim)
+        levels = getattr(h, "levels", getattr(h, "levels_1", [8, 5, 5, 5]))
+        self.quantizer = RFSQ(
+            levels=levels,
+            dim=latent_dim,
+            num_quantizers=self.num_quantizers,
+            channel_first=True,
+            stochastic=bool(getattr(h, "stochastic", False)),
+        )
 
         self.apply(self._init_weights)
 
@@ -126,13 +94,6 @@ class Encoder(nn.Module):
         h = F.gelu(h)
         latent = self.latent_conv(h)
 
-        z1, c1 = self.quantizer_1(self.layernorm_1(latent))
-        z1 = self.layernorm_1.inverse(z1)
-
-        z2, c2 = self.quantizer_2(self.layernorm_2(latent - z1.detach()))
-        z2 = self.layernorm_2.inverse(z2)
-        
-        zq = z1 + z2
-        codes = torch.stack([c1, c2], dim=1)
+        zq, codes = self.quantizer(latent)
 
         return zq, codes
