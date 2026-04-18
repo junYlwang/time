@@ -1,5 +1,5 @@
 runs_root: runs
-exp_name: dual-rvq-data-base
+exp_name: single-rfsq2-data-base
 ddp_backend: nccl
 ddp_find_unused_parameters: false
 seed: 1234
@@ -20,12 +20,12 @@ resume_skip_seen_batches: true
 keep_topk: 3
 
 # Segment sampling
-train_segment_length: 2048
-eval_segment_length: 2048
+train_segment_length: 4096
+eval_segment_length: 4096
 samples_per_epoch: 741655
 max_valid_sequences: 5000
 
-# Shared model hyperparameters
+# Model
 input_channels: 1
 output_channels: 1
 
@@ -40,6 +40,17 @@ seq_encoder_output_kernel_size: 11
 latent_output_conv_kernel_size: 11
 latent_dim: 16
 
+num_quantizers: 2
+quantizer_type: rfsq
+stochastic: false
+temp_steps: 30000
+levels: [8, 5, 5, 5]
+rvq_codebook_size: 1000
+rvq_codebook_dim: 8
+rvq_decay: 0.99
+rvq_quantize_dropout: false
+rvq_quantize_dropout_cutoff_index: 0
+
 decoder_base_dim: 32
 decoder_num_layers: [4, 3, 2]
 up_ratio: [2, 2, 2]
@@ -49,38 +60,6 @@ seq_decoder_channel: 128
 seq_decoder_input_kernel_size: 11
 seq_decoder_convnext_kernel_size: [6, 6, 6]
 seq_decoder_output_conv_kernel_size: 11
-
-# Decomposition
-decomposition:
-  num_channels: 1
-  kernel_sizes: [15, 31, 63, 127, 255]
-  weight_mode: dynamic
-  summary_length: 32
-  gating_hidden_dim: 64
-
-# Trend quantizer
-trend_quantizer_type: rvq
-trend_stochastic: false
-trend_num_quantizers: 1
-trend_levels_1: [8, 4, 4, 4]
-trend_levels_2: [8, 4, 4, 4]
-trend_rvq_codebook_size: 1024
-trend_rvq_codebook_dim: 8
-trend_rvq_decay: 0.99
-trend_rvq_quantize_dropout: false
-trend_rvq_quantize_dropout_cutoff_index: 0
-
-# Residual quantizer
-residual_quantizer_type: rvq
-residual_stochastic: false
-residual_num_quantizers: 1
-residual_levels_1: [8, 5, 5, 5]
-residual_levels_2: [8, 5, 5, 5]
-residual_rvq_codebook_size: 2048
-residual_rvq_codebook_dim: 8
-residual_rvq_decay: 0.99
-residual_rvq_quantize_dropout: false
-residual_rvq_quantize_dropout_cutoff_index: 0
 
 # Optimization
 train_batch_size: 1024
@@ -98,18 +77,15 @@ final_div_factor: 100
 smooth_l1_beta: 1.0
 stft_win_sizes: [128, 256, 512]
 raw_domain_loss_weight: 1.0
-norm_domain_loss_weight: 100.0
+norm_domain_loss_weight: 300.0
 raw_smooth_l1_weight: 1.0
-raw_diff_l1_weight: 1.0
-raw_stft_loss_weight: 100.0
-norm_smooth_l1_weight: 5.0
-norm_diff_l1_weight: 1.0
+raw_diff_l1_weight: 2.0
+raw_stft_loss_weight: 500.0
+norm_smooth_l1_weight: 2.0
+norm_diff_l1_weight: 2.0
 norm_stft_loss_weight: 1.0
-trend_loss_weight: 40.0
-residual_loss_weight: 10.0
-quantizer_loss_weight: 10.0
-temp_steps: 30000
 grad_clip_norm: 1.0
+quantizer_loss_weight: 1.0
 
 stdout_interval: 100
 summary_interval: 100
@@ -119,6 +95,6 @@ validation_interval: 1000
 # Inference
 inference:
   test_split: test
-  checkpoint_path: /mnt/shared-storage-gpfs2/brainllm2-share/junyi/time/runs/dual-rvq-data-base/2026-04-09_11-08-24__seed1234__gpu1/checkpoints/codec_steps=00020000_score=-3.3732
-  output_dir: /mnt/shared-storage-gpfs2/brainllm2-share/junyi/time/runs/dual-rvq-data-base/2026-04-09_11-08-24__seed1234__gpu1/test_20k
+  checkpoint_path: /mnt/shared-storage-gpfs2/brainllm2-share/junyi/time/runs/time-codec-rfsq-1000-zscore-stft-normal/2026-03-30_03-09-44__seed1234__gpu1/checkpoints/codec_steps=00200000_score=-0.9781
+  output_dir: /mnt/shared-storage-gpfs2/brainllm2-share/junyi/time/runs/time-codec-rfsq-1000-zscore-stft-normal/2026-03-30_03-09-44__seed1234__gpu1/test_200k
   num_visual_samples: 3

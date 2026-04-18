@@ -119,6 +119,6 @@ validation_interval: 1000
 # Inference
 inference:
   test_split: test
-  checkpoint_path: /path/to/dual_codec_checkpoint
-  output_dir: /mnt/shared-storage-gpfs2/brainllm2-share/junyi/time/runs/dual-codec-rfsq-zscore/debug_infer
+  checkpoint_path: /mnt/shared-storage-gpfs2/brainllm2-share/junyi/time/runs/dual-rvq-data-base/2026-04-09_11-08-24__seed1234__gpu1/checkpoints/codec_steps=00020000_score=-3.3732
+  output_dir: /mnt/shared-storage-gpfs2/brainllm2-share/junyi/time/runs/dual-rvq-data-base/2026-04-09_11-08-24__seed1234__gpu1/test_20k
   num_visual_samples: 3

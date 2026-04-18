@@ -24,6 +24,6 @@
   ],
   "test": [
     "/mnt/shared-storage-gpfs2/speechllm-share/data/Time-300B/datasets--Maple728--Time-300B/snapshots/b52d0ca9de8da5202f73a5057681fca6b48906fb/energy/australian_electricity_demand",
-    "/mnt/shared-storage-gpfs2/speechllm-share/data/Time-300B/datasets--Maple728--Time-300B/snapshots/b52d0ca9de8da5202f73a5057681fca6b48906fb/energy/gfc12_load"
+    "/mnt/shared-storage-gpfs2/speechllm-share/data/Time-300B/datasets--Maple728--Time-300B/snapshots/b52d0ca9de8da5202f73a5057681fca6b48906fb/energy/gfc17_load"
   ]
 }

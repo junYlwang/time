@@ -35,7 +35,7 @@ class BaseQuantizer(nn.Module):
         raise NotImplementedError
 
 
-class FSQResidualQuantizer(BaseQuantizer):
+class RFSQQuantizer(BaseQuantizer):
     def __init__(self, h):
         super().__init__()
         latent_dim = int(getattr(h, "latent_dim", 16))
@@ -108,7 +108,7 @@ class NoQuantizer(BaseQuantizer):
 def build_quantizer(h) -> BaseQuantizer:
     quantizer_type = str(getattr(h, "quantizer_type", "rfsq")).lower()
     if quantizer_type == "rfsq":
-        return FSQResidualQuantizer(h)
+        return RFSQQuantizer(h)
     if quantizer_type == "rvq":
         return RVQQuantizer(h)
     if quantizer_type == "none":
