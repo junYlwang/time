@@ -65,6 +65,7 @@ tb_logs/
 # =========================
 # Local data
 # =========================
+data/
 data/raw/
 data/processed/
 data/cache/
@@ -93,3 +94,9 @@ htmlcov/
 # =========================
 .env
 .env.*
+
+# =========================
+# configs
+# =========================
+configs/
+old_configs/
