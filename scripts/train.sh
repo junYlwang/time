@@ -1,9 +1,9 @@
 GPU=1
-CPU=$((GPU * 8))
+CPU=$((GPU * 16))
 MEMORY=$((GPU * 80000))
-rjob delete time-codec-single-rfsq4-data-base
+rjob delete ucr-linear-4
 rjob submit \
-  --name=time-codec-single-rfsq4-data-base \
+  --name=ucr-linear-4 \
   --gpu=$GPU \
   --cpu=$CPU \
   --memory=$MEMORY \
@@ -19,6 +19,7 @@ set -ex
 . /root/miniconda3/etc/profile.d/conda.sh
 cd /mnt/shared-storage-gpfs2/brainllm2-share/junyi/time
 conda activate time
-python -m tools.train \
---config /mnt/shared-storage-gpfs2/brainllm2-share/junyi/time/configs/single-rfsq4-data-base.yaml
+python /mnt/shared-storage-gpfs2/brainllm2-share/junyi/time/tools/run_ucr_suite.py \
+--config /mnt/shared-storage-gpfs2/brainllm2-share/junyi/time/configs/ucr-4.yaml \
+--max-concurrent 40
 '

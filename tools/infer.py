@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import random
 import sys
 import time
 from bisect import bisect_right
@@ -27,8 +26,7 @@ from datasets.time_moe_dataset import TimeMoEDataset
 from modules.decoder import Decoder
 from modules.encoder_wo_quantize import Encoder
 from modules.quantizer import build_quantizer
-from modules.revin import ReversibleInstanceNorm1D, ReversibleMeanAbsNorm1D
-from modules.utils import load_checkpoint, load_hparams
+from modules.utils import build_input_norm, inverse_revin, load_checkpoint, load_hparams, set_seed
 
 
 @dataclass
@@ -36,43 +34,6 @@ class SampleMeta:
     sample_index: int
     offset: int
     length: int
-
-
-def _set_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-
-def _inverse_revin(norm_module, y: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
-    return norm_module.inverse(y, mean, std)
-
-
-def _build_input_norm(h, device: torch.device):
-    norm_type = str(getattr(h, "normalization_type", "zscore")).lower()
-    if norm_type == "zscore":
-        mod = ReversibleInstanceNorm1D(
-            num_channels=int(getattr(h, "input_channels", 1)),
-            eps=float(getattr(h, "revin_eps", 1e-5)),
-            affine=bool(getattr(h, "revin_affine", True)),
-            init_gamma=float(getattr(h, "revin_init_gamma", 1.0)),
-            init_beta=float(getattr(h, "revin_init_beta", 0.0)),
-            positive_gamma=bool(getattr(h, "revin_positive_gamma", False)),
-        )
-    elif norm_type == "mean_abs":
-        mod = ReversibleMeanAbsNorm1D(
-            num_channels=int(getattr(h, "input_channels", 1)),
-            eps=float(getattr(h, "revin_eps", 1e-5)),
-            affine=bool(getattr(h, "revin_affine", True)),
-            init_gamma=float(getattr(h, "revin_init_gamma", 1.0)),
-            init_beta=float(getattr(h, "revin_init_beta", 0.0)),
-            positive_gamma=bool(getattr(h, "revin_positive_gamma", False)),
-        )
-    else:
-        raise ValueError(f"Unsupported normalization_type: {norm_type}. Expected one of: zscore, mean_abs")
-    return mod.to(device)
-
 
 def _set_quantizer_eval_mode(quantizer) -> None:
     if quantizer is None:
@@ -216,7 +177,7 @@ def _build_models(h, device: torch.device):
     encoder = Encoder(h).to(device)
     quantizer = build_quantizer(h).to(device)
     decoder = Decoder(h).to(device)
-    input_norm = _build_input_norm(h, device)
+    input_norm = build_input_norm(h, device)
     return encoder, quantizer, decoder, input_norm
 
 
@@ -322,7 +283,7 @@ def _infer_one_subset(
             latent = encoder(x_in)
             zq = quantizer(latent).z_q if quantizer is not None else latent
             x_hat_norm = decoder(zq)
-            x_hat = _inverse_revin(input_norm, x_hat_norm, mu, std) if use_reversible_norm else x_hat_norm
+            x_hat = inverse_revin(input_norm, x_hat_norm, mu, std) if use_reversible_norm else x_hat_norm
 
             tmin = min(x.shape[-1], x_hat.shape[-1])
             x_ref = x[:, 0, :tmin].detach().cpu().numpy()
@@ -401,7 +362,7 @@ def main() -> None:
     args = parser.parse_args()
 
     h = load_hparams(args.config)
-    _set_seed(int(getattr(h, "seed", 1234)))
+    set_seed(int(getattr(h, "seed", 1234)))
 
     infer_cfg = getattr(h, "inference", {}) or {}
     if not isinstance(infer_cfg, dict):

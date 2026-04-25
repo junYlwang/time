@@ -1,6 +1,6 @@
 GPU=1
 CPU=$((GPU * 8))
-MEMORY=$((GPU * 160000))
+MEMORY=$((GPU * 80000))
 rjob delete time-codec-infer
 rjob submit \
   --name=time-codec-infer \
