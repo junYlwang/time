@@ -234,26 +234,26 @@ def update_topk_and_prune(ckpt_dir: str, keep_k: int, score: float, steps: int):
     return records
 
 def _build_input_norm(h, device: torch.device):
-    norm_type = str(getattr(h, "normalization_type", "zscore")).lower()
+    norm_type = str(h.normalization_type).lower()
     if norm_type == "zscore":
         print("use zscore normalization")
         mod = ReversibleInstanceNorm1D(
-            num_channels=int(getattr(h, "input_channels", 1)),
-            eps=float(getattr(h, "revin_eps", 1e-5)),
-            affine=bool(getattr(h, "revin_affine", True)),
-            init_gamma=float(getattr(h, "revin_init_gamma", 1.0)),
-            init_beta=float(getattr(h, "revin_init_beta", 0.0)),
-            positive_gamma=bool(getattr(h, "revin_positive_gamma", False)),
+            num_channels=int(h.input_channels),
+            eps=float(h.revin_eps),
+            affine=bool(h.revin_affine),
+            init_gamma=float(h.revin_init_gamma),
+            init_beta=float(h.revin_init_beta),
+            positive_gamma=bool(h.revin_positive_gamma),
         )
     elif norm_type == "mean_abs":
         print("use mean_abs normalization")
         mod = ReversibleMeanAbsNorm1D(
-            num_channels=int(getattr(h, "input_channels", 1)),
-            eps=float(getattr(h, "revin_eps", 1e-5)),
-            affine=bool(getattr(h, "revin_affine", True)),
-            init_gamma=float(getattr(h, "revin_init_gamma", 1.0)),
-            init_beta=float(getattr(h, "revin_init_beta", 0.0)),
-            positive_gamma=bool(getattr(h, "revin_positive_gamma", False)),
+            num_channels=int(h.input_channels),
+            eps=float(h.revin_eps),
+            affine=bool(h.revin_affine),
+            init_gamma=float(h.revin_init_gamma),
+            init_beta=float(h.revin_init_beta),
+            positive_gamma=bool(h.revin_positive_gamma),
         )
     else:
         raise ValueError(f"Unsupported normalization_type: {norm_type}. Expected one of: zscore, mean_abs")

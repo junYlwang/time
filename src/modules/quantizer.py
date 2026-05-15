@@ -38,19 +38,15 @@ class BaseQuantizer(nn.Module):
 class RFSQQuantizer(BaseQuantizer):
     def __init__(self, h):
         super().__init__()
-        latent_dim = int(getattr(h, "latent_dim", 16))
-        num_quantizers = int(getattr(h, "num_quantizers", 2))
-        levels = getattr(h, "levels", getattr(h, "levels_1", [8, 5, 5, 5]))
-        use_stochastic = bool(getattr(h, "stochastic", False))
 
         self.rfsq = RFSQ(
-            levels=levels,
-            dim=latent_dim,
-            num_quantizers=num_quantizers,
+            levels=h.levels,
+            dim=h.latent_dim,
+            num_quantizers=h.num_quantizers,
             channel_first=True,
-            stochastic=use_stochastic,
+            stochastic=h.stochastic,
         )
-        self._num_quantizers = num_quantizers
+        self._num_quantizers = h.num_quantizers
         self._codebook_size = int(self.rfsq.codebook_size)
         self.is_stochastic_quantizer = True
 

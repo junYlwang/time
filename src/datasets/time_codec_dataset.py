@@ -12,21 +12,10 @@ from torch.utils.data import Dataset
 from .time_moe_dataset import TimeMoEDataset
 
 
-def _normalize_split_name(split: str) -> str:
-    s = split.lower().strip()
-    if s == "val":
-        return "valid"
-    return s
-
-
 def _extract_split_roots(manifest_obj, split: str) -> List[str]:
-    split = _normalize_split_name(split)
 
     if isinstance(manifest_obj, dict):
-        # Try exact key first.
         value = manifest_obj.get(split)
-        if value is None and split == "valid":
-            value = manifest_obj.get("val")
         if value is None:
             raise KeyError(f"Split '{split}' not found in split manifest")
     elif isinstance(manifest_obj, list):
@@ -36,9 +25,6 @@ def _extract_split_roots(manifest_obj, split: str) -> List[str]:
         value = manifest_obj
     else:
         raise ValueError("Split manifest must be a dict or a list")
-
-    if isinstance(value, dict):
-        value = value.get("roots", value.get("paths", None))
 
     if not isinstance(value, list):
         raise ValueError(f"Split '{split}' must map to a list of paths")
@@ -67,8 +53,8 @@ class SplitTimeSeriesCodecDataset(Dataset):
         max_valid_sequences: int = 2000,
         seed: int = 1234,
     ):
-        self.split = _normalize_split_name(split)
-        self.segment_length = int(segment_length)
+        self.split = split
+        self.segment_length = int(segment_length) #samples will be cropeed or padded to 'segment_length' length
         self.samples_per_epoch = int(samples_per_epoch)
         self.max_valid_sequences = int(max_valid_sequences)
         self.seed = int(seed)
@@ -86,8 +72,8 @@ class SplitTimeSeriesCodecDataset(Dataset):
         self.dataset_cumsum = [0]
         for ds in self.datasets:
             self.dataset_cumsum.append(self.dataset_cumsum[-1] + len(ds))
-        self.num_sequences = self.dataset_cumsum[-1]
-        self.dataset_lengths = [len(ds) for ds in self.datasets]
+        self.num_sequences = self.dataset_cumsum[-1] # number of total samples
+        self.dataset_lengths = [len(ds) for ds in self.datasets] # number of samples in each dataset
 
         if self.num_sequences <= 0:
             raise ValueError(f"Split '{self.split}' has zero sequences")
@@ -163,7 +149,7 @@ class SplitTimeSeriesCodecDataset(Dataset):
         # Deterministic sample selection inside each subset.
         valid_indices: List[int] = []
         base_rng = random.Random(self.seed + 271828)
-        for ds_idx, k in enumerate(quotas):
+        for ds_idx, k in enumerate(quotas): # k represents that the ds_idx-th dataset has k samples participating in the validation
             if k <= 0:
                 continue
             n = self.dataset_lengths[ds_idx]
