@@ -1,4 +1,4 @@
-GPU=2
+GPU=4
 CPU=$((GPU * 8))
 MEMORY=$((GPU * 80000))
 rjob delete codec-base-rfsq2-data-v1

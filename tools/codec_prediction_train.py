@@ -50,8 +50,8 @@ class CodePredictor(nn.Module):
         d_model = int(h.predictor_d_model)
         nhead = int(h.predictor_nhead)
         num_layers = int(h.predictor_num_layers)
-        mlp_ratio = float(h.predictor_mlp_ratio)
-        dropout = float(h.predictor_dropout)
+        mlp_ratio = h.predictor_mlp_ratio
+        dropout = h.predictor_dropout
 
         self.mask_token = nn.Parameter(torch.zeros(1, latent_dim, 1))
         self.in_proj = nn.Linear(latent_dim, d_model)
@@ -155,19 +155,19 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
             input_norm.parameters(),
             predictor.parameters(),
         ),
-        float(h.learning_rate),
-        betas=[float(h.adam_b1), float(h.adam_b2)],
+        h.learning_rate,
+        betas=[h.adam_b1, h.adam_b2],
     )
 
     total_steps = int(h.max_training_steps)
 
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optim_g,
-        max_lr=float(h.learning_rate),
+        max_lr=h.learning_rate,
         total_steps=total_steps,
-        pct_start=float(h.pct_start),
-        div_factor=float(h.div_factor),
-        final_div_factor=float(h.final_div_factor),
+        pct_start=h.pct_start,
+        div_factor=h.div_factor,
+        final_div_factor=h.final_div_factor,
         anneal_strategy="cos",
         last_epoch=-1,
     )
@@ -332,66 +332,91 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
         if _codes is not None and coverage_masks:
             with torch.no_grad():
                 _update_codebook_coverage_masks(_codes, coverage_masks)
-        pred_mask = _build_prediction_mask(
-            batch_size=z_q.size(0),
-            seq_len=z_q.size(-1),
-            mask_ratio=h.prediction_mask_ratio,
-            random_mask_prob=h.prediction_random_mask_prob,
-            device=device,
-        )
-        pred_logits = predictor(z_q, pred_mask)
-        pred_loss, pred_acc, pred_acc_layers = _prediction_loss_and_accuracy(pred_logits, _codes, pred_mask)
+        if h.prediction_loss_weight > 0.0:
+            pred_mask = _build_prediction_mask(
+                batch_size=z_q.size(0),
+                seq_len=z_q.size(-1),
+                mask_ratio=h.prediction_mask_ratio,
+                random_mask_prob=h.prediction_random_mask_prob,
+                device=device,
+            )
+            pred_logits = predictor(z_q, pred_mask)
+            pred_loss, pred_acc, pred_acc_layers = _prediction_loss_and_accuracy(pred_logits, _codes, pred_mask)
+        else:
+            pred_loss = torch.zeros((), device=device)
+            pred_acc = torch.zeros((), device=device)
+            pred_acc_layers = [torch.zeros((), device=device) for _ in codebook_sizes]
         x_hat_norm = decoder(z_q)
-        x_hat = _inverse_revin(input_norm, x_hat_norm, mu, std) if h.use_reversible_norm else x_hat_norm
+        tmin = min(x.size(-1), x_hat_norm.size(-1))
 
-        tmin = min(x.size(-1), x_hat.size(-1))
-        x_ref = x[..., :tmin]
-        x_rec = x_hat[..., :tmin]
-
-        loss_raw_smooth_l1 = F.smooth_l1_loss(
-            x_rec,
-            x_ref,
-            beta=float(h.smooth_l1_beta),
-        )
-        if tmin > 1:
-            loss_raw_diff = F.l1_loss(torch.diff(x_rec, dim=-1), torch.diff(x_ref, dim=-1))
+        if h.raw_domain_loss_weight > 0.0:
+            if h.use_reversible_norm:
+                std_for_raw = std.clamp(max=100000.0)
+                x_hat = _inverse_revin(input_norm, x_hat_norm, mu, std_for_raw)
+            else:
+                x_hat = x_hat_norm
+            x_ref = x[..., :tmin]
+            x_rec = x_hat[..., :tmin]
+            if h.raw_smooth_l1_weight > 0.0:
+                loss_raw_smooth_l1 = F.smooth_l1_loss(
+                    x_rec,
+                    x_ref,
+                    beta=h.smooth_l1_beta,
+                )
+            else:
+                loss_raw_smooth_l1 = torch.zeros((), device=device)
+            if h.raw_diff_l1_weight > 0.0 and tmin > 1:
+                loss_raw_diff = F.l1_loss(torch.diff(x_rec, dim=-1), torch.diff(x_ref, dim=-1))
+            else:
+                loss_raw_diff = torch.zeros((), device=device)
+            if h.raw_stft_loss_weight > 0.0:
+                loss_raw_stft = stft_loss_fn(x_rec, x_ref)
+            else:
+                loss_raw_stft = torch.zeros((), device=device)
+            loss_raw_total = (
+                h.raw_smooth_l1_weight * loss_raw_smooth_l1
+                + h.raw_diff_l1_weight * loss_raw_diff
+                + h.raw_stft_loss_weight * loss_raw_stft
+            )
         else:
+            loss_raw_smooth_l1 = torch.zeros((), device=device)
             loss_raw_diff = torch.zeros((), device=device)
-        if float(h.raw_stft_loss_weight) > 0.0:
-            loss_raw_stft = stft_loss_fn(x_rec, x_ref)
-        else:
             loss_raw_stft = torch.zeros((), device=device)
+            loss_raw_total = torch.zeros((), device=device)
 
-        x_norm_ref = x_in[..., :tmin]
-        x_norm_rec = x_hat_norm[..., :tmin]
-        loss_norm_smooth_l1 = F.smooth_l1_loss(
-            x_norm_rec,
-            x_norm_ref,
-            beta=float(h.smooth_l1_beta),
-        )
-        if tmin > 1:
-            loss_norm_diff = F.l1_loss(torch.diff(x_norm_rec, dim=-1), torch.diff(x_norm_ref, dim=-1))
+        if h.norm_domain_loss_weight > 0.0:
+            x_norm_ref = x_in[..., :tmin]
+            x_norm_rec = x_hat_norm[..., :tmin]
+            if h.norm_smooth_l1_weight > 0.0:
+                loss_norm_smooth_l1 = F.smooth_l1_loss(
+                    x_norm_rec,
+                    x_norm_ref,
+                    beta=h.smooth_l1_beta,
+                )
+            else:
+                loss_norm_smooth_l1 = torch.zeros((), device=device)
+            if h.norm_diff_l1_weight > 0.0 and tmin > 1:
+                loss_norm_diff = F.l1_loss(torch.diff(x_norm_rec, dim=-1), torch.diff(x_norm_ref, dim=-1))
+            else:
+                loss_norm_diff = torch.zeros((), device=device)
+            if h.norm_stft_loss_weight > 0.0:
+                loss_norm_stft = stft_loss_fn(x_norm_rec, x_norm_ref)
+            else:
+                loss_norm_stft = torch.zeros((), device=device)
+            loss_norm_total = (
+                h.norm_smooth_l1_weight * loss_norm_smooth_l1
+                + h.norm_diff_l1_weight * loss_norm_diff
+                + h.norm_stft_loss_weight * loss_norm_stft
+            )
         else:
+            loss_norm_smooth_l1 = torch.zeros((), device=device)
             loss_norm_diff = torch.zeros((), device=device)
-        if float(h.norm_stft_loss_weight) > 0.0:
-            loss_norm_stft = stft_loss_fn(x_norm_rec, x_norm_ref)
-        else:
             loss_norm_stft = torch.zeros((), device=device)
-
-        loss_raw_total = (
-            float(h.raw_smooth_l1_weight) * loss_raw_smooth_l1
-            + float(h.raw_diff_l1_weight) * loss_raw_diff
-            + float(h.raw_stft_loss_weight) * loss_raw_stft
-        )
-        loss_norm_total = (
-            float(h.norm_smooth_l1_weight) * loss_norm_smooth_l1
-            + float(h.norm_diff_l1_weight) * loss_norm_diff
-            + float(h.norm_stft_loss_weight) * loss_norm_stft
-        )
+            loss_norm_total = torch.zeros((), device=device)
 
         total_loss = (
             h.raw_domain_loss_weight * loss_raw_total
-            + float(h.norm_domain_loss_weight) * loss_norm_total
+            + h.norm_domain_loss_weight * loss_norm_total
             + h.quantizer_loss_weight * q_loss
             + h.prediction_loss_weight * pred_loss
         )
@@ -498,65 +523,97 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
                     quant_out_b = quantizer(latent_b)
                     zq = quant_out_b.z_q
                     codes_b = quant_out_b.codes
-                    random_mask = _build_prediction_mask(
-                        batch_size=zq.size(0),
-                        seq_len=zq.size(-1),
-                        mask_ratio=h.prediction_mask_ratio,
-                        random_mask_prob=h.prediction_random_mask_prob,
-                        device=device,
-                        mode="random",
-                        generator=eval_random_generator,
-                    )
-                    suffix_mask = _build_prediction_mask(
-                        batch_size=zq.size(0),
-                        seq_len=zq.size(-1),
-                        mask_ratio=h.prediction_mask_ratio,
-                        random_mask_prob=h.prediction_random_mask_prob,
-                        device=device,
-                        mode="suffix",
-                    )
-                    random_logits = predictor(zq, random_mask)
-                    suffix_logits = predictor(zq, suffix_mask)
-                    pred_random_loss, pred_random_acc, _ = _prediction_loss_and_accuracy(
-                        random_logits, codes_b, random_mask
-                    )
-                    pred_suffix_loss, pred_suffix_acc, _ = _prediction_loss_and_accuracy(
-                        suffix_logits, codes_b, suffix_mask
-                    )
+                    if h.prediction_loss_weight > 0.0:
+                        random_mask = _build_prediction_mask(
+                            batch_size=zq.size(0),
+                            seq_len=zq.size(-1),
+                            mask_ratio=h.prediction_mask_ratio,
+                            random_mask_prob=h.prediction_random_mask_prob,
+                            device=device,
+                            mode="random",
+                            generator=eval_random_generator,
+                        )
+                        suffix_mask = _build_prediction_mask(
+                            batch_size=zq.size(0),
+                            seq_len=zq.size(-1),
+                            mask_ratio=h.prediction_mask_ratio,
+                            random_mask_prob=h.prediction_random_mask_prob,
+                            device=device,
+                            mode="suffix",
+                        )
+                        random_logits = predictor(zq, random_mask)
+                        suffix_logits = predictor(zq, suffix_mask)
+                        pred_random_loss, pred_random_acc, _ = _prediction_loss_and_accuracy(
+                            random_logits, codes_b, random_mask
+                        )
+                        pred_suffix_loss, pred_suffix_acc, _ = _prediction_loss_and_accuracy(
+                            suffix_logits, codes_b, suffix_mask
+                        )
+                    else:
+                        pred_random_loss = torch.zeros((), device=device)
+                        pred_random_acc = torch.zeros((), device=device)
+                        pred_suffix_loss = torch.zeros((), device=device)
+                        pred_suffix_acc = torch.zeros((), device=device)
                     xr_norm = decoder(zq)
-                    xr = _inverse_revin(input_norm, xr_norm, xb_mu, xb_std) if h.use_reversible_norm else xr_norm
-                    tmin = min(xb.size(-1), xr.size(-1))
+                    tmin = min(xb.size(-1), xr_norm.size(-1))
                     xb_ref = xb[..., :tmin]
-                    xr_rec = xr[..., :tmin]
-                    mae = F.l1_loss(xr_rec, xb_ref)
                     xr_norm_rec = xr_norm[..., :tmin]
                     xb_norm_ref = xb_in[..., :tmin]
-                    raw_smooth_l1 = F.smooth_l1_loss(xr_rec, xb_ref, beta=float(h.smooth_l1_beta))
-                    norm_smooth_l1 = F.smooth_l1_loss(xr_norm_rec, xb_norm_ref, beta=float(h.smooth_l1_beta))
-                    if tmin > 1:
-                        raw_diff = F.l1_loss(torch.diff(xr_rec, dim=-1), torch.diff(xb_ref, dim=-1))
-                        norm_diff = F.l1_loss(torch.diff(xr_norm_rec, dim=-1), torch.diff(xb_norm_ref, dim=-1))
+                    mae = F.l1_loss(xr_norm_rec, xb_norm_ref)
+
+                    if h.raw_domain_loss_weight > 0.0:
+                        if h.use_reversible_norm:
+                            xb_std_for_raw = xb_std.clamp(max=100000.0)
+                            xr = _inverse_revin(input_norm, xr_norm, xb_mu, xb_std_for_raw)
+                        else:
+                            xr = xr_norm
+                        xr_rec = xr[..., :tmin]
+                        if h.raw_smooth_l1_weight > 0.0:
+                            raw_smooth_l1 = F.smooth_l1_loss(xr_rec, xb_ref, beta=h.smooth_l1_beta)
+                        else:
+                            raw_smooth_l1 = torch.zeros((), device=device)
+                        if h.raw_diff_l1_weight > 0.0 and tmin > 1:
+                            raw_diff = F.l1_loss(torch.diff(xr_rec, dim=-1), torch.diff(xb_ref, dim=-1))
+                        else:
+                            raw_diff = torch.zeros((), device=device)
+                        if h.raw_stft_loss_weight > 0.0:
+                            raw_stft = stft_loss_fn(xr_rec, xb_ref)
+                        else:
+                            raw_stft = torch.zeros((), device=device)
+                        raw_total = (
+                            h.raw_smooth_l1_weight * raw_smooth_l1
+                            + h.raw_diff_l1_weight * raw_diff
+                            + h.raw_stft_loss_weight * raw_stft
+                        )
                     else:
+                        raw_smooth_l1 = torch.zeros((), device=device)
                         raw_diff = torch.zeros((), device=device)
-                        norm_diff = torch.zeros((), device=device)
-                    if float(h.raw_stft_loss_weight) > 0.0:
-                        raw_stft = stft_loss_fn(xr_rec, xb_ref)
-                    else:
                         raw_stft = torch.zeros((), device=device)
-                    if float(h.norm_stft_loss_weight) > 0.0:
-                        norm_stft = stft_loss_fn(xr_norm_rec, xb_norm_ref)
+                        raw_total = torch.zeros((), device=device)
+
+                    if h.norm_domain_loss_weight > 0.0:
+                        if h.norm_smooth_l1_weight > 0.0:
+                            norm_smooth_l1 = F.smooth_l1_loss(xr_norm_rec, xb_norm_ref, beta=h.smooth_l1_beta)
+                        else:
+                            norm_smooth_l1 = torch.zeros((), device=device)
+                        if h.norm_diff_l1_weight > 0.0 and tmin > 1:
+                            norm_diff = F.l1_loss(torch.diff(xr_norm_rec, dim=-1), torch.diff(xb_norm_ref, dim=-1))
+                        else:
+                            norm_diff = torch.zeros((), device=device)
+                        if h.norm_stft_loss_weight > 0.0:
+                            norm_stft = stft_loss_fn(xr_norm_rec, xb_norm_ref)
+                        else:
+                            norm_stft = torch.zeros((), device=device)
+                        norm_total = (
+                            h.norm_smooth_l1_weight * norm_smooth_l1
+                            + h.norm_diff_l1_weight * norm_diff
+                            + h.norm_stft_loss_weight * norm_stft
+                        )
                     else:
+                        norm_smooth_l1 = torch.zeros((), device=device)
+                        norm_diff = torch.zeros((), device=device)
                         norm_stft = torch.zeros((), device=device)
-                    raw_total = (
-                        float(h.raw_smooth_l1_weight) * raw_smooth_l1
-                        + float(h.raw_diff_l1_weight) * raw_diff
-                        + float(h.raw_stft_loss_weight) * raw_stft
-                    )
-                    norm_total = (
-                        float(h.norm_smooth_l1_weight) * norm_smooth_l1
-                        + float(h.norm_diff_l1_weight) * norm_diff
-                        + float(h.norm_stft_loss_weight) * norm_stft
-                    )
+                        norm_total = torch.zeros((), device=device)
                     eval_mae_sum += mae
                     eval_raw_total_sum += raw_total
                     eval_raw_smooth_l1_sum += raw_smooth_l1
