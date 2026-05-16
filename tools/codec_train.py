@@ -44,6 +44,7 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
     device = torch.device("cuda", local_rank) if torch.cuda.is_available() else torch.device("cpu")
 
     set_seed(int(h.seed) + rank)
+    torch.autograd.set_detect_anomaly(True)
 
     encoder = Encoder(h).to(device)
     quantizer = build_quantizer(h).to(device)
@@ -99,7 +100,7 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
         encoder = DDP(encoder, device_ids=ddp_ids, find_unused_parameters=h.ddp_find_unused_parameters)
         quantizer = DDP(quantizer, device_ids=ddp_ids, find_unused_parameters=h.ddp_find_unused_parameters)
         decoder = DDP(decoder, device_ids=ddp_ids, find_unused_parameters=h.ddp_find_unused_parameters)
-        input_norm = DDP(input_norm, device_ids=ddp_ids, find_unused_parameters=h.ddp_find_unused_parameters)
+        #input_norm = DDP(input_norm, device_ids=ddp_ids, find_unused_parameters=h.ddp_find_unused_parameters)
 
     trainset = SplitTimeSeriesCodecDataset(
         split_manifest_path=h.split_manifest_path,
@@ -228,64 +229,80 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
             with torch.no_grad():
                 _update_codebook_coverage_masks(_codes, coverage_masks)
         x_hat_norm = decoder(z_q)
-        x_hat = _inverse_revin(input_norm, x_hat_norm, mu, std) if h.use_reversible_norm else x_hat_norm
-
-        tmin = min(x.size(-1), x_hat.size(-1))
-        x_ref = x[..., :tmin]
-        x_rec = x_hat[..., :tmin]
-
-        loss_raw_smooth_l1 = F.smooth_l1_loss(
-            x_rec,
-            x_ref,
-            beta=float(h.smooth_l1_beta),
-        )
-        if tmin > 1:
-            loss_raw_diff = F.l1_loss(torch.diff(x_rec, dim=-1), torch.diff(x_ref, dim=-1))
+        tmin = min(x.size(-1), x_hat_norm.size(-1))
+        if float(h.raw_domain_loss_weight) > 0.0:
+            x_hat = _inverse_revin(input_norm, x_hat_norm, mu, std) if h.use_reversible_norm else x_hat_norm
+            x_ref = x[..., :tmin]
+            x_rec = x_hat[..., :tmin]
+            if float(h.raw_smooth_l1_weight) > 0.0:
+                loss_raw_smooth_l1 = F.smooth_l1_loss(
+                    x_rec,
+                    x_ref,
+                    beta=float(h.smooth_l1_beta),
+                )
+            else:
+                loss_raw_smooth_l1 = torch.zeros((), device=device)
+            if float(h.raw_diff_l1_weight) > 0.0 and tmin > 1:
+                loss_raw_diff = F.l1_loss(torch.diff(x_rec, dim=-1), torch.diff(x_ref, dim=-1))
+            else:
+                loss_raw_diff = torch.zeros((), device=device)
+            if float(h.raw_stft_loss_weight) > 0.0:
+                loss_raw_stft = stft_loss_fn(x_rec, x_ref)
+            else:
+                loss_raw_stft = torch.zeros((), device=device)
+            loss_raw_total = (
+                float(h.raw_smooth_l1_weight) * loss_raw_smooth_l1
+                + float(h.raw_diff_l1_weight) * loss_raw_diff
+                + float(h.raw_stft_loss_weight) * loss_raw_stft
+            )
         else:
+            loss_raw_smooth_l1 = torch.zeros((), device=device)
             loss_raw_diff = torch.zeros((), device=device)
-        if float(h.raw_stft_loss_weight) > 0.0:
-            loss_raw_stft = stft_loss_fn(x_rec, x_ref)
-        else:
             loss_raw_stft = torch.zeros((), device=device)
+            loss_raw_total = torch.zeros((), device=device)
 
-        x_norm_ref = x_in[..., :tmin]
-        x_norm_rec = x_hat_norm[..., :tmin]
-        loss_norm_smooth_l1 = F.smooth_l1_loss(
-            x_norm_rec,
-            x_norm_ref,
-            beta=float(h.smooth_l1_beta),
-        )
-        if tmin > 1:
-            loss_norm_diff = F.l1_loss(torch.diff(x_norm_rec, dim=-1), torch.diff(x_norm_ref, dim=-1))
+        if float(h.norm_domain_loss_weight) > 0.0:
+            x_norm_ref = x_in[..., :tmin]
+            x_norm_rec = x_hat_norm[..., :tmin]
+            if float(h.norm_smooth_l1_weight) > 0.0:
+                loss_norm_smooth_l1 = F.smooth_l1_loss(
+                    x_norm_rec,
+                    x_norm_ref,
+                    beta=float(h.smooth_l1_beta),
+                )
+            else:
+                loss_norm_smooth_l1 = torch.zeros((), device=device)
+            if float(h.norm_diff_l1_weight) > 0.0 and tmin > 1:
+                loss_norm_diff = F.l1_loss(torch.diff(x_norm_rec, dim=-1), torch.diff(x_norm_ref, dim=-1))
+            else:
+                loss_norm_diff = torch.zeros((), device=device)
+            if float(h.norm_stft_loss_weight) > 0.0:
+                loss_norm_stft = stft_loss_fn(x_norm_rec, x_norm_ref)
+            else:
+                loss_norm_stft = torch.zeros((), device=device)
+            loss_norm_total = (
+                float(h.norm_smooth_l1_weight) * loss_norm_smooth_l1
+                + float(h.norm_diff_l1_weight) * loss_norm_diff
+                + float(h.norm_stft_loss_weight) * loss_norm_stft
+            )
         else:
+            loss_norm_smooth_l1 = torch.zeros((), device=device)
             loss_norm_diff = torch.zeros((), device=device)
-        if float(h.norm_stft_loss_weight) > 0.0:
-            loss_norm_stft = stft_loss_fn(x_norm_rec, x_norm_ref)
-        else:
             loss_norm_stft = torch.zeros((), device=device)
-
-        loss_raw_total = (
-            float(h.raw_smooth_l1_weight) * loss_raw_smooth_l1
-            + float(h.raw_diff_l1_weight) * loss_raw_diff
-            + float(h.raw_stft_loss_weight) * loss_raw_stft
-        )
-        loss_norm_total = (
-            float(h.norm_smooth_l1_weight) * loss_norm_smooth_l1
-            + float(h.norm_diff_l1_weight) * loss_norm_diff
-            + float(h.norm_stft_loss_weight) * loss_norm_stft
-        )
+            loss_norm_total = torch.zeros((), device=device)
 
         total_loss = (
-            h.raw_domain_loss_weight * loss_raw_total
+            float(h.raw_domain_loss_weight) * loss_raw_total
             + float(h.norm_domain_loss_weight) * loss_norm_total
-            + h.quantizer_loss_weight * q_loss
+            + float(h.quantizer_loss_weight) * q_loss
         )
 
         total_loss.backward()
-        # torch.nn.utils.clip_grad_norm_(
-        #     itertools.chain(encoder.parameters(), quantizer.parameters(), decoder.parameters(), input_norm.parameters()),
-        #     max_norm=float(getattr(h, "grad_clip_norm", 1.0)),
-        # )
+        if h.use_grad_clip:
+            torch.nn.utils.clip_grad_norm_(
+                itertools.chain(encoder.parameters(), quantizer.parameters(), decoder.parameters(), input_norm.parameters()),
+                max_norm=float(h.grad_clip_norm),
+            )
         optim_g.step()
         scheduler.step()
 

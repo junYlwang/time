@@ -25,6 +25,7 @@ class MultiScaleLogMagSTFTLoss(nn.Module):
     def __init__(self, win_sizes: Iterable[int]):
         super().__init__()
         self.win_sizes = _validate_win_sizes(win_sizes)
+        self.mag_eps = 1e-7
 
     def forward(self, x_rec: torch.Tensor, x_ref: torch.Tensor) -> torch.Tensor:
         if x_rec.shape != x_ref.shape:
@@ -58,8 +59,10 @@ class MultiScaleLogMagSTFTLoss(nn.Module):
                 return_complex=True,
             )
 
-            rec_log_mag = torch.log1p(torch.abs(rec_spec))
-            ref_log_mag = torch.log1p(torch.abs(ref_spec))
+            rec_mag = torch.sqrt(rec_spec.real.square() + rec_spec.imag.square() + self.mag_eps)
+            ref_mag = torch.sqrt(ref_spec.real.square() + ref_spec.imag.square() + self.mag_eps)
+            rec_log_mag = torch.log1p(rec_mag)
+            ref_log_mag = torch.log1p(ref_mag)
             losses.append(F.l1_loss(rec_log_mag, ref_log_mag))
 
         return torch.stack(losses).mean()
