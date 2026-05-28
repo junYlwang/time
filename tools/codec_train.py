@@ -32,10 +32,11 @@ if _SRC_DIR not in sys.path:
 from modules.encoder_wo_quantize import Encoder
 from modules.decoder import Decoder
 from modules.loss import MultiScaleLogMagSTFTLoss
+from modules.revin import ReversibleInstanceNorm1D
 from modules.quantizer import build_quantizer
 from modules.utils import load_hparams, build_env, load_checkpoint, save_checkpoint, get_state_dict, \
-    set_seed, _set_quantizer_mode, update_topk_and_prune, _build_input_norm, reduce_mean, \
-    _infer_codec_state_paths, _inverse_revin, _update_codebook_coverage_masks, \
+    set_seed, update_topk_and_prune, reduce_mean, \
+    infer_codec_state_paths, inverse_revin, _update_codebook_coverage_masks, \
     _compute_global_codebook_coverage, _init_coverage_masks
 
 from datasets.time_codec_dataset import SplitTimeSeriesCodecDataset
@@ -48,7 +49,14 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
     encoder = Encoder(h).to(device)
     quantizer = build_quantizer(h).to(device)
     decoder = Decoder(h).to(device)
-    input_norm = _build_input_norm(h, device)
+    input_norm = ReversibleInstanceNorm1D(
+        num_channels=int(h.input_channels),
+        eps=float(h.revin_eps),
+        affine=bool(h.revin_affine),
+        init_gamma=float(h.revin_init_gamma),
+        init_beta=float(h.revin_init_beta),
+        positive_gamma=bool(h.revin_positive_gamma),
+    ).to(device)
     stft_loss_fn = MultiScaleLogMagSTFTLoss(win_sizes=h.stft_win_sizes).to(device)
 
     optim_g = torch.optim.AdamW(
@@ -74,7 +82,7 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
     state_dict_scheduler = None
     cp_codec, cp_state = None, None
     if resume_from_checkpoint:
-        cp_codec, cp_state = _infer_codec_state_paths(resume_from_checkpoint)
+        cp_codec, cp_state = infer_codec_state_paths(resume_from_checkpoint)
         if not os.path.isfile(cp_codec):
             raise FileNotFoundError(f"codec checkpoint not found: {cp_codec}")
         if not os.path.isfile(cp_state):
@@ -191,13 +199,6 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
                 break
 
     while steps < total_steps:
-        if h.stochastic and bool(getattr(quantizer_for_cov, "is_stochastic_quantizer", False)):
-            if steps <= h.temp_steps:
-                current_temp = max(0.3, 1.0 - (steps / max(1, h.temp_steps)))
-            else:
-                current_temp = 0.3
-            _set_quantizer_mode(quantizer, stochastic=True, temperature=current_temp)
-
         try:
             x = next(train_iter)
         except StopIteration:
@@ -214,10 +215,7 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
 
         optim_g.zero_grad()
 
-        if h.use_reversible_norm:
-            x_in, mu, std = input_norm(x)
-        else:
-            x_in, mu, std = x, None, None
+        x_in, mu, std = input_norm(x)
 
         latent = encoder(x_in)
         quant_out = quantizer(latent)
@@ -230,11 +228,8 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
         x_hat_norm = decoder(z_q)
         tmin = min(x.size(-1), x_hat_norm.size(-1))
         if h.raw_domain_loss_weight > 0.0:
-            if h.use_reversible_norm:
-                std_for_raw = std.clamp(max=100000.0)
-                x_hat = _inverse_revin(input_norm, x_hat_norm, mu, std_for_raw)
-            else:
-                x_hat = x_hat_norm
+            std_for_raw = std.clamp(max=100000.0)
+            x_hat = inverse_revin(input_norm, x_hat_norm, mu, std_for_raw)
             x_ref = x[..., :tmin]
             x_rec = x_hat[..., :tmin]
             if h.raw_smooth_l1_weight > 0.0:
@@ -363,9 +358,6 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
             decoder.eval()
             input_norm.eval()
 
-            if h.stochastic and bool(getattr(quantizer_for_cov, "is_stochastic_quantizer", False)):
-                _set_quantizer_mode(quantizer, stochastic=False, temperature=0.3)
-
             eval_mae_sum = torch.zeros((), device=device)
             eval_raw_total_sum = torch.zeros((), device=device)
             eval_raw_smooth_l1_sum = torch.zeros((), device=device)
@@ -380,10 +372,7 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
             with torch.no_grad():
                 for xb in eval_loader:
                     xb = xb.to(device, non_blocking=True)
-                    if h.use_reversible_norm:
-                        xb_in, xb_mu, xb_std = input_norm(xb)
-                    else:
-                        xb_in, xb_mu, xb_std = xb, None, None
+                    xb_in, xb_mu, xb_std = input_norm(xb)
                     latent_b = encoder(xb_in)
                     zq = quantizer(latent_b).z_q
                     xr_norm = decoder(zq)
@@ -394,11 +383,8 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
                     mae = F.l1_loss(xr_norm_rec, xb_norm_ref)
 
                     if h.raw_domain_loss_weight > 0.0:
-                        if h.use_reversible_norm:
-                            xb_std_for_raw = xb_std.clamp(max=100000.0)
-                            xr = _inverse_revin(input_norm, xr_norm, xb_mu, xb_std_for_raw)
-                        else:
-                            xr = xr_norm
+                        xb_std_for_raw = xb_std.clamp(max=100000.0)
+                        xr = inverse_revin(input_norm, xr_norm, xb_mu, xb_std_for_raw)
                         xr_rec = xr[..., :tmin]
                         if h.raw_smooth_l1_weight > 0.0:
                             raw_smooth_l1 = F.smooth_l1_loss(xr_rec, xb_ref, beta=h.smooth_l1_beta)

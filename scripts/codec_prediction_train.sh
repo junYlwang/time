@@ -1,15 +1,15 @@
-GPU=2
+GPU=4
 CPU=$((GPU * 8))
 MEMORY=$((GPU * 80000))
-rjob delete codec-prediction-rfsq2-data-v1
+rjob delete 512-codec-prediction-rfsq2-data-v1
 rjob submit \
-  --name=codec-prediction-rfsq2-data-v1 \
+  --name=512-codec-prediction-rfsq2-data-v1 \
   --gpu=$GPU \
   --cpu=$CPU \
   --memory=$MEMORY \
-  --charged-group="speechllm_gpu" \
+  --charged-group="brainllm_gpu" \
   --private-machine=group \
-  --namespace="ailab-speechllm" \
+  --namespace="ailab-brainllm" \
   --mount=gpfs://gpfs1/wangjunyi:/mnt/shared-storage-user/wangjunyi \
   --mount=gpfs://gpfs1/brainllm-share:/mnt/shared-storage-user/brainllm-share \
   --mount=gpfs://gpfs2/speechllm-share:/mnt/shared-storage-gpfs2/speechllm-share \
@@ -21,6 +21,6 @@ set -ex
 . /root/miniconda3/etc/profile.d/conda.sh
 cd /mnt/shared-storage-user/wangjunyi/time
 conda activate time
-torchrun --nproc_per_node=2 /mnt/shared-storage-user/wangjunyi/time/tools/codec_prediction_train.py \
+torchrun --nproc_per_node=4 /mnt/shared-storage-user/wangjunyi/time/tools/codec_prediction_train.py \
 --config /mnt/shared-storage-user/wangjunyi/time/configs/codec-prediction-rfsq2-data-v1.yaml
 '

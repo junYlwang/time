@@ -52,12 +52,14 @@ class SplitTimeSeriesCodecDataset(Dataset):
         samples_per_epoch: int = 500000,
         max_valid_sequences: int = 2000,
         seed: int = 1234,
+        return_valid_length: bool = False,
     ):
         self.split = split
         self.segment_length = int(segment_length) #samples will be cropeed or padded to 'segment_length' length
         self.samples_per_epoch = int(samples_per_epoch)
         self.max_valid_sequences = int(max_valid_sequences)
         self.seed = int(seed)
+        self.return_valid_length = bool(return_valid_length)
         self.epoch = 0
 
         with open(split_manifest_path, "r", encoding="utf-8") as f:
@@ -184,12 +186,23 @@ class SplitTimeSeriesCodecDataset(Dataset):
         seq = np.asarray(self.datasets[ds_idx][local_idx], dtype=np.float32)
         return seq
 
-    def _segment_from_seq(self, seq: np.ndarray, start: int) -> np.ndarray:
+    def _segment_from_seq(self, seq: np.ndarray, start: int) -> tuple[np.ndarray, int]:
         end = start + self.segment_length
         seg = seq[start:end]
+        valid_length = min(int(seg.size), self.segment_length)
         if seg.size < self.segment_length:
-            seg = np.pad(seg, (0, self.segment_length - seg.size), mode="constant", constant_values=0.0)
-        return seg
+            pad_width = self.segment_length - seg.size
+            seg = np.pad(seg, (pad_width, 0), mode="constant", constant_values=0.0)
+        return seg, valid_length
+
+    def _format_item(self, seg: np.ndarray, valid_length: int):
+        x = torch.from_numpy(seg).unsqueeze(0)  # [1, T]
+        if not self.return_valid_length:
+            return x
+        return {
+            "x": x,
+            "valid_length": torch.tensor(int(valid_length), dtype=torch.long),
+        }
 
     def __getitem__(self, idx: int) -> torch.Tensor:
         if self.split == "train":
@@ -208,14 +221,14 @@ class SplitTimeSeriesCodecDataset(Dataset):
             else:
                 start = 0
 
-            seg = self._segment_from_seq(seq, start)
-            return torch.from_numpy(seg).unsqueeze(0)  # [1, T]
+            seg, valid_length = self._segment_from_seq(seq, start)
+            return self._format_item(seg, valid_length)
 
         # Validation/Test: deterministic selection and deterministic slicing.
         global_seq_idx = self.valid_seq_indices[idx]
         seq = self._fetch_seq(global_seq_idx)
-        seg = self._segment_from_seq(seq, start=0)
-        return torch.from_numpy(seg).unsqueeze(0)
+        seg, valid_length = self._segment_from_seq(seq, start=0)
+        return self._format_item(seg, valid_length)
 
 
 __all__ = [

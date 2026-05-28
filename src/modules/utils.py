@@ -13,7 +13,6 @@ import shutil
 import random
 import numpy as np
 from typing import Tuple
-from modules.revin import ReversibleInstanceNorm1D, ReversibleMeanAbsNorm1D
 
 class AttrDict(dict):
     def __init__(self, *args, **kwargs):
@@ -38,17 +37,6 @@ def build_env(config, config_name, path):
     if config != t_path:
         os.makedirs(path, exist_ok=True)
         shutil.copyfile(config, os.path.join(path, config_name))
-        
-def plot_spectrogram(spectrogram):
-    fig, ax = plt.subplots(figsize=(10, 2))
-    im = ax.imshow(spectrogram, aspect="auto", origin="lower",
-                   interpolation='none')
-    plt.colorbar(im, ax=ax)
-
-    fig.canvas.draw()
-    plt.close()
-
-    return fig
 
 
 def init_weights(m, mean=0.0, std=0.01):
@@ -119,7 +107,8 @@ def set_seed(seed: int) -> None:
 
 
 def inverse_revin(norm_module, y: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
-    return _inverse_revin(norm_module, y, mean, std)
+    mod = norm_module.module if hasattr(norm_module, "module") else norm_module
+    return mod.inverse(y, mean, std)
 
 
 def reduce_mean(value: torch.Tensor, world_size: int) -> torch.Tensor:
@@ -129,32 +118,6 @@ def reduce_mean(value: torch.Tensor, world_size: int) -> torch.Tensor:
     dist.all_reduce(out, op=dist.ReduceOp.SUM)
     return out / world_size
 
-
-def _infer_codec_state_paths(resume_path: str) -> Tuple[str, str]:
-    d = os.path.dirname(resume_path)
-    base = os.path.basename(resume_path)
-
-    if base.startswith("state_"):
-        state_path = resume_path
-        codec_path = os.path.join(d, "codec_" + base[len("state_"):])
-    elif base.startswith("codec_"):
-        codec_path = resume_path
-        state_path = os.path.join(d, "state_" + base[len("codec_"):])
-    else:
-        raise ValueError(f"--resume_from_checkpoint must point to codec_* or state_*, got: {resume_path}")
-
-    return codec_path, state_path
-
-
-def _set_quantizer_mode(quantizer, stochastic: bool, temperature: float) -> None:
-    q = quantizer.module if hasattr(quantizer, "module") else quantizer
-    if hasattr(q, "set_stochastic_mode"):
-        q.set_stochastic_mode(stochastic=stochastic, temperature=temperature)
-
-
-def _inverse_revin(norm_module, y: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
-    mod = norm_module.module if hasattr(norm_module, "module") else norm_module
-    return mod.inverse(y, mean, std)
 
 
 def _update_codebook_coverage_masks(codes: torch.Tensor, masks: list[torch.Tensor]) -> None:
@@ -232,33 +195,3 @@ def update_topk_and_prune(ckpt_dir: str, keep_k: int, score: float, steps: int):
 
     _save_topk(record_path, records)
     return records
-
-def _build_input_norm(h, device: torch.device):
-    norm_type = str(h.normalization_type).lower()
-    if norm_type == "zscore":
-        print("use zscore normalization")
-        mod = ReversibleInstanceNorm1D(
-            num_channels=int(h.input_channels),
-            eps=float(h.revin_eps),
-            affine=bool(h.revin_affine),
-            init_gamma=float(h.revin_init_gamma),
-            init_beta=float(h.revin_init_beta),
-            positive_gamma=bool(h.revin_positive_gamma),
-        )
-    elif norm_type == "mean_abs":
-        print("use mean_abs normalization")
-        mod = ReversibleMeanAbsNorm1D(
-            num_channels=int(h.input_channels),
-            eps=float(h.revin_eps),
-            affine=bool(h.revin_affine),
-            init_gamma=float(h.revin_init_gamma),
-            init_beta=float(h.revin_init_beta),
-            positive_gamma=bool(h.revin_positive_gamma),
-        )
-    else:
-        raise ValueError(f"Unsupported normalization_type: {norm_type}. Expected one of: zscore, mean_abs")
-    return mod.to(device)
-
-
-def build_input_norm(h, device: torch.device):
-    return _build_input_norm(h, device)

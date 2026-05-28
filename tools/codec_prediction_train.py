@@ -6,6 +6,7 @@ warnings.simplefilter(action="ignore", category=FutureWarning)
 import argparse
 import itertools
 import json
+import math
 import os
 import random
 import socket
@@ -33,105 +34,81 @@ if _SRC_DIR not in sys.path:
 from modules.encoder_wo_quantize import Encoder
 from modules.decoder import Decoder
 from modules.loss import MultiScaleLogMagSTFTLoss
-from modules.probe import RMSNorm, TransformerBlock
+from modules.revin import ReversibleInstanceNorm1D
+from modules.predictor import CodePredictor, _build_prediction_mask, _prediction_loss_and_accuracy
 from modules.quantizer import build_quantizer
 from modules.utils import load_hparams, build_env, load_checkpoint, save_checkpoint, get_state_dict, \
-    set_seed, _set_quantizer_mode, update_topk_and_prune, _build_input_norm, reduce_mean, \
-    _infer_codec_state_paths, _inverse_revin, _update_codebook_coverage_masks, \
+    set_seed, update_topk_and_prune, reduce_mean, \
+    infer_codec_state_paths, inverse_revin, _update_codebook_coverage_masks, \
     _compute_global_codebook_coverage, _init_coverage_masks
 
 from datasets.time_codec_dataset import SplitTimeSeriesCodecDataset
 
 
-class CodePredictor(nn.Module):
-    def __init__(self, h, codebook_sizes: tuple[int, ...]):
-        super().__init__()
-        latent_dim = int(h.latent_dim)
-        d_model = int(h.predictor_d_model)
-        nhead = int(h.predictor_nhead)
-        num_layers = int(h.predictor_num_layers)
-        mlp_ratio = h.predictor_mlp_ratio
-        dropout = h.predictor_dropout
-
-        self.mask_token = nn.Parameter(torch.zeros(1, latent_dim, 1))
-        self.in_proj = nn.Linear(latent_dim, d_model)
-        self.blocks = nn.ModuleList(
-            [
-                TransformerBlock(
-                    d_model=d_model,
-                    nhead=nhead,
-                    mlp_ratio=mlp_ratio,
-                    dropout=dropout,
-                )
-                for _ in range(num_layers)
-            ]
-        )
-        self.norm = RMSNorm(d_model)
-        self.heads = nn.ModuleList([nn.Linear(d_model, int(size)) for size in codebook_sizes])
-        self.apply(self._init_weights)
-
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            nn.init.trunc_normal_(module.weight, std=0.02)
-            if module.bias is not None:
-                nn.init.constant_(module.bias, 0)
-
-    def forward(self, z_q: torch.Tensor, mask: torch.Tensor) -> list[torch.Tensor]:
-        z_masked = torch.where(mask[:, None, :], self.mask_token.to(dtype=z_q.dtype), z_q)
-        x = z_masked.transpose(1, 2)
-        x = self.in_proj(x)
-        for block in self.blocks:
-            x = block(x)
-        x = self.norm(x)
-        return [head(x) for head in self.heads]
 
 
-def _build_prediction_mask(
-    batch_size: int,
-    seq_len: int,
-    mask_ratio: float,
-    random_mask_prob: float,
-    device: torch.device,
-    mode: str | None = None,
-    generator: torch.Generator | None = None,
+def _valid_mask_from_lengths(valid_lengths: torch.Tensor, time_steps: int, device: torch.device) -> torch.Tensor:
+    valid_lengths = valid_lengths.to(device=device, dtype=torch.long).clamp(min=0, max=time_steps)
+    positions = torch.arange(time_steps, device=device).view(1, 1, time_steps)
+    starts = time_steps - valid_lengths.view(-1, 1, 1)
+    return positions >= starts
+
+
+def _masked_input_norm(input_norm, x: torch.Tensor, valid_lengths: torch.Tensor):
+    if x.ndim != 3:
+        raise ValueError(f"Expected [B, C, T], got shape={tuple(x.shape)}")
+    valid_mask = _valid_mask_from_lengths(valid_lengths, x.size(-1), x.device)
+    valid = valid_mask.to(dtype=x.dtype)
+    count = valid.sum(dim=-1, keepdim=True).clamp_min(1.0)
+    mean = (x * valid).sum(dim=-1, keepdim=True) / count
+    var = ((x - mean).square() * valid).sum(dim=-1, keepdim=True) / count
+    std = torch.sqrt(var + float(getattr(input_norm, "eps", 1.0e-5)))
+    y = (x - mean) / std
+    if bool(getattr(input_norm, "affine", False)):
+        y = y * input_norm._get_gamma() + input_norm.beta
+    y = torch.where(valid_mask, y, torch.zeros_like(y))
+    return y, mean, std, valid_mask
+
+
+def _masked_smooth_l1_loss(x_rec: torch.Tensor, x_ref: torch.Tensor, mask: torch.Tensor, beta: float) -> torch.Tensor:
+    loss = F.smooth_l1_loss(x_rec, x_ref, beta=beta, reduction="none")
+    weight = mask.to(dtype=loss.dtype)
+    return (loss * weight).sum() / weight.sum().clamp_min(1.0)
+
+
+def _masked_diff_l1_loss(x_rec: torch.Tensor, x_ref: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    if x_rec.size(-1) <= 1:
+        return torch.zeros((), device=x_rec.device)
+    diff_mask = mask[..., 1:] & mask[..., :-1]
+    if not bool(diff_mask.any()):
+        return torch.zeros((), device=x_rec.device)
+    loss = torch.abs(torch.diff(x_rec, dim=-1) - torch.diff(x_ref, dim=-1))
+    weight = diff_mask.to(dtype=loss.dtype)
+    return (loss * weight).sum() / weight.sum().clamp_min(1.0)
+
+
+def _valid_only_stft_loss(
+    stft_loss_fn,
+    x_rec: torch.Tensor,
+    x_ref: torch.Tensor,
+    valid_lengths: torch.Tensor,
+    win_sizes,
 ) -> torch.Tensor:
-    mask_count = max(1, int(round(seq_len * float(mask_ratio))))
-    mask = torch.zeros(batch_size, seq_len, device=device, dtype=torch.bool)
-
-    if mode == "random":
-        use_random = torch.ones(batch_size, device=device, dtype=torch.bool)
-    elif mode == "suffix":
-        use_random = torch.zeros(batch_size, device=device, dtype=torch.bool)
-    else:
-        use_random = torch.rand(batch_size, device=device, generator=generator) < float(random_mask_prob)
-
-    suffix_rows = ~use_random
-    if suffix_rows.any():
-        mask[suffix_rows, seq_len - mask_count:] = True
-
-    for row_idx in torch.nonzero(use_random, as_tuple=False).flatten().tolist():
-        indices = torch.randperm(seq_len, device=device, generator=generator)[:mask_count]
-        mask[row_idx, indices] = True
-    return mask
-
-
-def _prediction_loss_and_accuracy(
-    logits_by_layer: list[torch.Tensor],
-    codes: torch.Tensor,
-    mask: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]]:
+    max_win = max(int(w) for w in win_sizes)
     losses = []
-    accuracies = []
-    for layer_idx, logits in enumerate(logits_by_layer):
-        targets = codes[:, layer_idx, :].long()
-        masked_logits = logits[mask]
-        masked_targets = targets[mask]
-        losses.append(F.cross_entropy(masked_logits, masked_targets))
-        accuracies.append((masked_logits.argmax(dim=-1) == masked_targets).float().mean())
-    loss = torch.stack(losses).mean()
-    accuracy = torch.stack(accuracies).mean()
-    return loss, accuracy, accuracies
-
+    time_steps = x_rec.size(-1)
+    for row_idx, valid_length in enumerate(valid_lengths.detach().cpu().tolist()):
+        valid_length = min(int(valid_length), time_steps)
+        if valid_length >= max_win:
+            losses.append(
+                stft_loss_fn(
+                    x_rec[row_idx:row_idx + 1, :, -valid_length:],
+                    x_ref[row_idx:row_idx + 1, :, -valid_length:],
+                )
+            )
+    if not losses:
+        return torch.zeros((), device=x_rec.device)
+    return torch.stack(losses).mean()
 
 def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint: str = "") -> None:
     device = torch.device("cuda", local_rank) if torch.cuda.is_available() else torch.device("cpu")
@@ -141,7 +118,14 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
     encoder = Encoder(h).to(device)
     quantizer = build_quantizer(h).to(device)
     decoder = Decoder(h).to(device)
-    input_norm = _build_input_norm(h, device)
+    input_norm = ReversibleInstanceNorm1D(
+        num_channels=int(h.input_channels),
+        eps=float(h.revin_eps),
+        affine=bool(h.revin_affine),
+        init_gamma=float(h.revin_init_gamma),
+        init_beta=float(h.revin_init_beta),
+        positive_gamma=bool(h.revin_positive_gamma),
+    ).to(device)
     quantizer_for_cfg = quantizer.module if hasattr(quantizer, "module") else quantizer
     codebook_sizes = tuple(getattr(quantizer_for_cfg, "codebook_sizes", ()))
     predictor = CodePredictor(h, codebook_sizes).to(device)
@@ -176,7 +160,7 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
     state_dict_scheduler = None
     cp_codec, cp_state = None, None
     if resume_from_checkpoint:
-        cp_codec, cp_state = _infer_codec_state_paths(resume_from_checkpoint)
+        cp_codec, cp_state = infer_codec_state_paths(resume_from_checkpoint)
         if not os.path.isfile(cp_codec):
             raise FileNotFoundError(f"codec checkpoint not found: {cp_codec}")
         if not os.path.isfile(cp_state):
@@ -202,7 +186,7 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
         encoder = DDP(encoder, device_ids=ddp_ids, find_unused_parameters=h.ddp_find_unused_parameters)
         quantizer = DDP(quantizer, device_ids=ddp_ids, find_unused_parameters=h.ddp_find_unused_parameters)
         decoder = DDP(decoder, device_ids=ddp_ids, find_unused_parameters=h.ddp_find_unused_parameters)
-        input_norm = DDP(input_norm, device_ids=ddp_ids, find_unused_parameters=h.ddp_find_unused_parameters)
+        # input_norm = DDP(input_norm, device_ids=ddp_ids, find_unused_parameters=h.ddp_find_unused_parameters)
         predictor = DDP(predictor, device_ids=ddp_ids, find_unused_parameters=h.ddp_find_unused_parameters)
 
     trainset = SplitTimeSeriesCodecDataset(
@@ -213,6 +197,7 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
         samples_per_epoch=int(h.samples_per_epoch),
         max_valid_sequences=int(h.max_valid_sequences),
         seed=int(h.seed),
+        return_valid_length=True,
     )
     if world_size > 1 and dist.is_initialized():
         train_sampler = DistributedSampler(
@@ -243,6 +228,7 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
         samples_per_epoch=1,  # unused for valid split
         max_valid_sequences=h.max_valid_sequences,
         seed=int(h.seed),
+        return_valid_length=True,
     )
     if world_size > 1 and dist.is_initialized():
         eval_sampler = DistributedSampler(
@@ -296,13 +282,6 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
                 break
 
     while steps < total_steps:
-        if h.stochastic and bool(getattr(quantizer_for_cov, "is_stochastic_quantizer", False)):
-            if steps <= h.temp_steps:
-                current_temp = max(0.3, 1.0 - (steps / max(1, h.temp_steps)))
-            else:
-                current_temp = 0.3
-            _set_quantizer_mode(quantizer, stochastic=True, temperature=current_temp)
-
         try:
             x = next(train_iter)
         except StopIteration:
@@ -315,14 +294,12 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
 
         start = time.time()
 
-        x = x.to(device, non_blocking=True)  # [B, 1, T]
+        valid_lengths = x["valid_length"].to(device, non_blocking=True).long()
+        x = x["x"].to(device, non_blocking=True)  # [B, 1, T]
 
         optim_g.zero_grad()
 
-        if h.use_reversible_norm:
-            x_in, mu, std = input_norm(x)
-        else:
-            x_in, mu, std = x, None, None
+        x_in, mu, std, valid_mask = _masked_input_norm(input_norm, x, valid_lengths)
 
         latent = encoder(x_in)
         quant_out = quantizer(latent)
@@ -332,7 +309,11 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
         if _codes is not None and coverage_masks:
             with torch.no_grad():
                 _update_codebook_coverage_masks(_codes, coverage_masks)
-        if h.prediction_loss_weight > 0.0:
+        pred_loss = torch.zeros((), device=device)
+        pred_codec_loss = torch.zeros((), device=device)
+        pred_acc = torch.zeros((), device=device)
+        pred_acc_layers = [torch.zeros((), device=device) for _ in codebook_sizes]
+        if h.prediction_loss_weight > 0.0 or h.prediction_codec_loss_weight > 0.0:
             pred_mask = _build_prediction_mask(
                 batch_size=z_q.size(0),
                 seq_len=z_q.size(-1),
@@ -340,37 +321,50 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
                 random_mask_prob=h.prediction_random_mask_prob,
                 device=device,
             )
-            pred_logits = predictor(z_q, pred_mask)
-            pred_loss, pred_acc, pred_acc_layers = _prediction_loss_and_accuracy(pred_logits, _codes, pred_mask)
-        else:
-            pred_loss = torch.zeros((), device=device)
-            pred_acc = torch.zeros((), device=device)
-            pred_acc_layers = [torch.zeros((), device=device) for _ in codebook_sizes]
+            if h.prediction_loss_weight > 0.0:
+                pred_logits = predictor(z_q.detach(), pred_mask)
+                pred_loss, pred_acc, pred_acc_layers = _prediction_loss_and_accuracy(pred_logits, _codes, pred_mask)
+            if h.prediction_codec_loss_weight > 0.0:
+                pred_codec_logits = predictor(z_q, pred_mask)
+                pred_codec_loss, pred_codec_acc, pred_codec_acc_layers = _prediction_loss_and_accuracy(
+                    pred_codec_logits, _codes, pred_mask
+                )
+                
         x_hat_norm = decoder(z_q)
         tmin = min(x.size(-1), x_hat_norm.size(-1))
+        valid_lengths_t = valid_lengths.clamp(max=tmin)
+        valid_mask_t = valid_mask[..., :tmin]
+        
+        usage_loss = torch.zeros((), device=device)
+        if h.usage_loss_weight > 0.0:
+            usage_probs = quantizer_for_cov.rfsq.saved_usage_probs
+            for layer_usage_probs in usage_probs:
+                layer_usage_prob = layer_usage_probs.mean(dim=(0, 1, 2))
+                usage_loss = usage_loss + (
+                    layer_usage_prob * ((layer_usage_prob + 1e-8).log() + math.log(h.codebook_size))
+                ).sum()
+            usage_loss = usage_loss / h.num_quantizers
 
         if h.raw_domain_loss_weight > 0.0:
-            if h.use_reversible_norm:
-                std_for_raw = std.clamp(max=100000.0)
-                x_hat = _inverse_revin(input_norm, x_hat_norm, mu, std_for_raw)
-            else:
-                x_hat = x_hat_norm
+            std_for_raw = std.clamp(max=100000.0)
+            x_hat = inverse_revin(input_norm, x_hat_norm, mu, std_for_raw)
             x_ref = x[..., :tmin]
             x_rec = x_hat[..., :tmin]
             if h.raw_smooth_l1_weight > 0.0:
-                loss_raw_smooth_l1 = F.smooth_l1_loss(
+                loss_raw_smooth_l1 = _masked_smooth_l1_loss(
                     x_rec,
                     x_ref,
+                    valid_mask_t,
                     beta=h.smooth_l1_beta,
                 )
             else:
                 loss_raw_smooth_l1 = torch.zeros((), device=device)
             if h.raw_diff_l1_weight > 0.0 and tmin > 1:
-                loss_raw_diff = F.l1_loss(torch.diff(x_rec, dim=-1), torch.diff(x_ref, dim=-1))
+                loss_raw_diff = _masked_diff_l1_loss(x_rec, x_ref, valid_mask_t)
             else:
                 loss_raw_diff = torch.zeros((), device=device)
             if h.raw_stft_loss_weight > 0.0:
-                loss_raw_stft = stft_loss_fn(x_rec, x_ref)
+                loss_raw_stft = _valid_only_stft_loss(stft_loss_fn, x_rec, x_ref, valid_lengths_t, h.stft_win_sizes)
             else:
                 loss_raw_stft = torch.zeros((), device=device)
             loss_raw_total = (
@@ -388,19 +382,20 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
             x_norm_ref = x_in[..., :tmin]
             x_norm_rec = x_hat_norm[..., :tmin]
             if h.norm_smooth_l1_weight > 0.0:
-                loss_norm_smooth_l1 = F.smooth_l1_loss(
+                loss_norm_smooth_l1 = _masked_smooth_l1_loss(
                     x_norm_rec,
                     x_norm_ref,
+                    valid_mask_t,
                     beta=h.smooth_l1_beta,
                 )
             else:
                 loss_norm_smooth_l1 = torch.zeros((), device=device)
             if h.norm_diff_l1_weight > 0.0 and tmin > 1:
-                loss_norm_diff = F.l1_loss(torch.diff(x_norm_rec, dim=-1), torch.diff(x_norm_ref, dim=-1))
+                loss_norm_diff = _masked_diff_l1_loss(x_norm_rec, x_norm_ref, valid_mask_t)
             else:
                 loss_norm_diff = torch.zeros((), device=device)
             if h.norm_stft_loss_weight > 0.0:
-                loss_norm_stft = stft_loss_fn(x_norm_rec, x_norm_ref)
+                loss_norm_stft = _valid_only_stft_loss(stft_loss_fn, x_norm_rec, x_norm_ref, valid_lengths_t, h.stft_win_sizes)
             else:
                 loss_norm_stft = torch.zeros((), device=device)
             loss_norm_total = (
@@ -419,6 +414,8 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
             + h.norm_domain_loss_weight * loss_norm_total
             + h.quantizer_loss_weight * q_loss
             + h.prediction_loss_weight * pred_loss
+            + h.prediction_codec_loss_weight * pred_codec_loss
+            + h.usage_loss_weight * usage_loss
         )
 
         total_loss.backward()
@@ -442,15 +439,18 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
         log_norm_stft = reduce_mean(loss_norm_stft, world_size).item()
         log_q = reduce_mean(q_loss, world_size).item()
         log_pred = reduce_mean(pred_loss, world_size).item()
+        log_pred_codec = reduce_mean(pred_codec_loss, world_size).item()
         log_pred_acc = reduce_mean(pred_acc, world_size).item()
         log_pred_acc_layers = [reduce_mean(acc, world_size).item() for acc in pred_acc_layers]
+        log_usage = reduce_mean(usage_loss, world_size).item()
 
         if rank == 0 and steps % int(h.stdout_interval) == 0:
             print(
                 f"Steps: {steps} | Total: {log_total:.4f} | "
                 f"Raw(S1:{log_raw_smooth_l1:.4f}, D:{log_raw_diff:.4f}, STFT:{log_raw_stft:.4f}, T:{log_raw_total:.4f}) | "
                 f"Norm(S1:{log_norm_smooth_l1:.4f}, D:{log_norm_diff:.4f}, STFT:{log_norm_stft:.4f}, T:{log_norm_total:.4f}) | "
-                f"Q: {log_q:.4f} | Pred:{log_pred:.4f} | PredAcc:{log_pred_acc:.4f} | "
+                f"Q: {log_q:.4f} | Pred:{log_pred:.4f} | PredCodec:{log_pred_codec:.4f} | PredAcc:{log_pred_acc:.4f} | "
+                f"Usage loss: {log_usage:.4f} | "
                 f"s/b: {time.time() - start:.3f}"
             )
 
@@ -466,7 +466,9 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
             sw.add_scalar("train/norm/stft_loss", log_norm_stft, steps)
             sw.add_scalar("train/quantizer_loss", log_q, steps)
             sw.add_scalar("train/prediction_loss", log_pred, steps)
+            sw.add_scalar("train/prediction_codec_loss", log_pred_codec, steps)
             sw.add_scalar("train/prediction_acc", log_pred_acc, steps)
+            sw.add_scalar("train/usage_loss", log_usage, steps)
             for level_idx, acc in enumerate(log_pred_acc_layers, start=1):
                 sw.add_scalar(f"train/prediction_acc_l{level_idx}", acc, steps)
             sw.add_scalar("train/lr", scheduler.get_last_lr()[0], steps)
@@ -492,9 +494,6 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
             input_norm.eval()
             predictor.eval()
 
-            if h.stochastic and bool(getattr(quantizer_for_cov, "is_stochastic_quantizer", False)):
-                _set_quantizer_mode(quantizer, stochastic=False, temperature=0.3)
-
             eval_mae_sum = torch.zeros((), device=device)
             eval_raw_total_sum = torch.zeros((), device=device)
             eval_raw_smooth_l1_sum = torch.zeros((), device=device)
@@ -514,11 +513,9 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
 
             with torch.no_grad():
                 for xb in eval_loader:
-                    xb = xb.to(device, non_blocking=True)
-                    if h.use_reversible_norm:
-                        xb_in, xb_mu, xb_std = input_norm(xb)
-                    else:
-                        xb_in, xb_mu, xb_std = xb, None, None
+                    xb_valid_lengths = xb["valid_length"].to(device, non_blocking=True).long()
+                    xb = xb["x"].to(device, non_blocking=True)
+                    xb_in, xb_mu, xb_std, xb_valid_mask = _masked_input_norm(input_norm, xb, xb_valid_lengths)
                     latent_b = encoder(xb_in)
                     quant_out_b = quantizer(latent_b)
                     zq = quant_out_b.z_q
@@ -556,28 +553,28 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
                         pred_suffix_acc = torch.zeros((), device=device)
                     xr_norm = decoder(zq)
                     tmin = min(xb.size(-1), xr_norm.size(-1))
+                    xb_valid_lengths_t = xb_valid_lengths.clamp(max=tmin)
+                    xb_valid_mask_t = xb_valid_mask[..., :tmin]
                     xb_ref = xb[..., :tmin]
                     xr_norm_rec = xr_norm[..., :tmin]
                     xb_norm_ref = xb_in[..., :tmin]
-                    mae = F.l1_loss(xr_norm_rec, xb_norm_ref)
+                    mae_weight = xb_valid_mask_t.to(dtype=xr_norm_rec.dtype)
+                    mae = (torch.abs(xr_norm_rec - xb_norm_ref) * mae_weight).sum() / mae_weight.sum().clamp_min(1.0)
 
                     if h.raw_domain_loss_weight > 0.0:
-                        if h.use_reversible_norm:
-                            xb_std_for_raw = xb_std.clamp(max=100000.0)
-                            xr = _inverse_revin(input_norm, xr_norm, xb_mu, xb_std_for_raw)
-                        else:
-                            xr = xr_norm
+                        xb_std_for_raw = xb_std.clamp(max=100000.0)
+                        xr = inverse_revin(input_norm, xr_norm, xb_mu, xb_std_for_raw)
                         xr_rec = xr[..., :tmin]
                         if h.raw_smooth_l1_weight > 0.0:
-                            raw_smooth_l1 = F.smooth_l1_loss(xr_rec, xb_ref, beta=h.smooth_l1_beta)
+                            raw_smooth_l1 = _masked_smooth_l1_loss(xr_rec, xb_ref, xb_valid_mask_t, beta=h.smooth_l1_beta)
                         else:
                             raw_smooth_l1 = torch.zeros((), device=device)
                         if h.raw_diff_l1_weight > 0.0 and tmin > 1:
-                            raw_diff = F.l1_loss(torch.diff(xr_rec, dim=-1), torch.diff(xb_ref, dim=-1))
+                            raw_diff = _masked_diff_l1_loss(xr_rec, xb_ref, xb_valid_mask_t)
                         else:
                             raw_diff = torch.zeros((), device=device)
                         if h.raw_stft_loss_weight > 0.0:
-                            raw_stft = stft_loss_fn(xr_rec, xb_ref)
+                            raw_stft = _valid_only_stft_loss(stft_loss_fn, xr_rec, xb_ref, xb_valid_lengths_t, h.stft_win_sizes)
                         else:
                             raw_stft = torch.zeros((), device=device)
                         raw_total = (
@@ -593,15 +590,15 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
 
                     if h.norm_domain_loss_weight > 0.0:
                         if h.norm_smooth_l1_weight > 0.0:
-                            norm_smooth_l1 = F.smooth_l1_loss(xr_norm_rec, xb_norm_ref, beta=h.smooth_l1_beta)
+                            norm_smooth_l1 = _masked_smooth_l1_loss(xr_norm_rec, xb_norm_ref, xb_valid_mask_t, beta=h.smooth_l1_beta)
                         else:
                             norm_smooth_l1 = torch.zeros((), device=device)
                         if h.norm_diff_l1_weight > 0.0 and tmin > 1:
-                            norm_diff = F.l1_loss(torch.diff(xr_norm_rec, dim=-1), torch.diff(xb_norm_ref, dim=-1))
+                            norm_diff = _masked_diff_l1_loss(xr_norm_rec, xb_norm_ref, xb_valid_mask_t)
                         else:
                             norm_diff = torch.zeros((), device=device)
                         if h.norm_stft_loss_weight > 0.0:
-                            norm_stft = stft_loss_fn(xr_norm_rec, xb_norm_ref)
+                            norm_stft = _valid_only_stft_loss(stft_loss_fn, xr_norm_rec, xb_norm_ref, xb_valid_lengths_t, h.stft_win_sizes)
                         else:
                             norm_stft = torch.zeros((), device=device)
                         norm_total = (

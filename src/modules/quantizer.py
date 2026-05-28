@@ -21,15 +21,10 @@ class QuantizerOutput:
 class BaseQuantizer(nn.Module):
     def __init__(self):
         super().__init__()
-        self.is_stochastic_quantizer = False
 
     @property
     def codebook_sizes(self) -> Tuple[int, ...]:
         return ()
-
-    def set_stochastic_mode(self, stochastic: bool, temperature: float) -> None:
-        _ = stochastic
-        _ = temperature
 
     def forward(self, latent: torch.Tensor) -> QuantizerOutput:
         raise NotImplementedError
@@ -44,19 +39,13 @@ class RFSQQuantizer(BaseQuantizer):
             dim=h.latent_dim,
             num_quantizers=h.num_quantizers,
             channel_first=True,
-            stochastic=h.stochastic,
         )
         self._num_quantizers = h.num_quantizers
         self._codebook_size = int(self.rfsq.codebook_size)
-        self.is_stochastic_quantizer = True
 
     @property
     def codebook_sizes(self) -> Tuple[int, ...]:
         return tuple([self._codebook_size] * self._num_quantizers)
-
-    def set_stochastic_mode(self, stochastic: bool, temperature: float) -> None:
-        self.rfsq.set_stochastic(stochastic)
-        self.rfsq.set_temperature(temperature)
 
     def forward(self, latent: torch.Tensor) -> QuantizerOutput:
         z_q, codes = self.rfsq(latent)
@@ -67,9 +56,9 @@ class RFSQQuantizer(BaseQuantizer):
 class RVQQuantizer(BaseQuantizer):
     def __init__(self, h):
         super().__init__()
-        latent_dim = int(getattr(h, "latent_dim", 8))
-        num_quantizers = int(getattr(h, "num_quantizers", 2))
-        codebook_size = int(getattr(h, "rvq_codebook_size", 1024))
+        latent_dim = h.latent_dim
+        num_quantizers = h.num_quantizers
+        codebook_size = h.rvq_codebook_size
         codebook_dim = int(getattr(h, "rvq_codebook_dim", latent_dim))
         quantize_dropout = bool(getattr(h, "rvq_quantize_dropout", False))
         quantize_dropout_cutoff_index = int(getattr(h, "rvq_quantize_dropout_cutoff_index", 0))

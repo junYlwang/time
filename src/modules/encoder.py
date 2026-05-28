@@ -68,7 +68,6 @@ class Encoder(nn.Module):
             dim=latent_dim,
             num_quantizers=self.num_quantizers,
             channel_first=True,
-            stochastic=bool(getattr(h, "stochastic", False)),
         )
 
         self.apply(self._init_weights)

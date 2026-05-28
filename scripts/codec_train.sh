@@ -21,6 +21,6 @@ set -ex
 . /root/miniconda3/etc/profile.d/conda.sh
 cd /mnt/shared-storage-user/wangjunyi/time
 conda activate time
-torchrun --nproc_per_node=2 /mnt/shared-storage-user/wangjunyi/time/tools/codec_train.py \
+torchrun --nproc_per_node=4 /mnt/shared-storage-user/wangjunyi/time/tools/codec_train.py \
 --config /mnt/shared-storage-user/wangjunyi/time/configs/codec-base-rfsq2-data-v1.yaml
 '

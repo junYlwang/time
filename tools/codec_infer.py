@@ -26,7 +26,8 @@ from datasets.time_moe_dataset import TimeMoEDataset
 from modules.decoder import Decoder
 from modules.encoder_wo_quantize import Encoder
 from modules.quantizer import build_quantizer
-from modules.utils import build_input_norm, inverse_revin, load_checkpoint, load_hparams, set_seed
+from modules.revin import ReversibleInstanceNorm1D
+from modules.utils import inverse_revin, load_checkpoint, load_hparams, set_seed
 
 
 @dataclass
@@ -34,13 +35,6 @@ class SampleMeta:
     sample_index: int
     offset: int
     length: int
-
-def _set_quantizer_eval_mode(quantizer) -> None:
-    if quantizer is None:
-        return
-    q = quantizer.module if hasattr(quantizer, "module") else quantizer
-    if hasattr(q, "set_stochastic_mode"):
-        q.set_stochastic_mode(stochastic=False, temperature=0.3)
 
 
 def _normalize_split_name(split: str) -> str:
@@ -102,6 +96,98 @@ def _safe_int(v, default: int = -1) -> int:
         return int(v)
     except Exception:
         return default
+
+
+def _downsample_factor(h) -> int:
+    factor = 1
+    for ratio in getattr(h, "down_ratio"):
+        ratio = int(ratio)
+        if ratio <= 0:
+            raise ValueError(f"down_ratio values must be positive, got {getattr(h, 'down_ratio')}")
+        factor *= ratio
+    return factor
+
+
+def _parse_bool(value, name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "y"}:
+            return True
+        if normalized in {"false", "0", "no", "n"}:
+            return False
+    raise ValueError(f"{name} must be a bool, got {value!r}")
+
+
+def _pad_to_multiple(
+    x: np.ndarray,
+    multiple: int,
+    padding_mode: str,
+    preserve_prepad_stats: bool,
+) -> Tuple[np.ndarray, int, float, float]:
+    if multiple <= 0:
+        raise ValueError(f"padding multiple must be positive, got {multiple}")
+    x = x.astype(np.float32, copy=False)
+    pad_len = (-int(x.shape[0])) % multiple
+    if pad_len == 0:
+        return x, 0, 1.0, 0.0
+
+    mode = str(padding_mode).strip().lower()
+    if mode == "zero":
+        pad = np.zeros((pad_len,), dtype=np.float32)
+    elif mode == "constant":
+        pad = np.full((pad_len,), float(x[-1]), dtype=np.float32)
+    elif mode == "reflect":
+        if x.shape[0] == 1:
+            pad = np.full((pad_len,), float(x[-1]), dtype=np.float32)
+        else:
+            pad = np.pad(x, (0, pad_len), mode="reflect")[-pad_len:].astype(np.float32, copy=False)
+    else:
+        raise ValueError(
+            f"Unsupported padding_mode: {padding_mode}. Expected one of: zero, constant, reflect"
+        )
+
+    gamma = 1.0
+    beta = 0.0
+    if preserve_prepad_stats:
+        original_mean = float(np.mean(x))
+        original_var = float(np.var(x))
+        pad_mean = float(np.mean(pad))
+        pad_var = float(np.var(pad))
+        eps = 1.0e-12
+        if original_var <= eps:
+            gamma = 0.0
+            beta = original_mean
+            pad = np.full((pad_len,), original_mean, dtype=np.float32)
+        elif mode == "zero":
+            gamma = 0.0
+            beta = original_mean
+            pad = np.full((pad_len,), original_mean, dtype=np.float32)
+        elif mode == "constant":
+            signs = np.where(np.arange(pad_len) % 2 == 0, 1.0, -1.0).astype(np.float64)
+            sign_mean = float(np.mean(signs))
+            centered_energy = float(np.sum((signs - sign_mean) ** 2))
+            if centered_energy <= eps:
+                gamma = 0.0
+                beta = original_mean
+                pad = np.full((pad_len,), original_mean, dtype=np.float32)
+            else:
+                amplitude = float(np.sqrt((pad_len * original_var) / centered_energy))
+                center = float(original_mean - amplitude * sign_mean)
+                gamma = amplitude
+                beta = center
+                pad = (center + amplitude * signs).astype(np.float32, copy=False)
+        elif pad_len == 1 or pad_var <= eps:
+            gamma = 0.0
+            beta = original_mean
+            pad = np.full((pad_len,), original_mean, dtype=np.float32)
+        else:
+            gamma = float(np.sqrt(original_var / pad_var))
+            beta = float(original_mean - gamma * pad_mean)
+            pad = (gamma * pad + beta).astype(np.float32, copy=False)
+
+    return np.concatenate([x, pad], axis=0), pad_len, gamma, beta
 
 
 class SingleSubsetInferenceDataset(Dataset):
@@ -177,7 +263,14 @@ def _build_models(h, device: torch.device):
     encoder = Encoder(h).to(device)
     quantizer = build_quantizer(h).to(device)
     decoder = Decoder(h).to(device)
-    input_norm = build_input_norm(h, device)
+    input_norm = ReversibleInstanceNorm1D(
+        num_channels=int(h.input_channels),
+        eps=float(h.revin_eps),
+        affine=bool(h.revin_affine),
+        init_gamma=float(h.revin_init_gamma),
+        init_beta=float(h.revin_init_beta),
+        positive_gamma=bool(h.revin_positive_gamma),
+    ).to(device)
     return encoder, quantizer, decoder, input_norm
 
 
@@ -213,7 +306,6 @@ def _load_codec_checkpoint(h, device: torch.device):
         quantizer.eval()
     decoder.eval()
     input_norm.eval()
-    _set_quantizer_eval_mode(quantizer)
 
     return encoder, quantizer, decoder, input_norm, checkpoint_path
 
@@ -263,47 +355,69 @@ def _infer_one_subset(
     lengths_all = np.zeros((n,), dtype=np.int64)
     offsets_all = np.full((n,), -1, dtype=np.int64)
     valid_len_all = np.zeros((n,), dtype=np.int64)
+    padding_gamma_all = np.ones((n,), dtype=np.float64)
+    padding_beta_all = np.zeros((n,), dtype=np.float64)
+    original_mean_all = np.zeros((n,), dtype=np.float64)
+    original_var_all = np.zeros((n,), dtype=np.float64)
+    padded_mean_all = np.zeros((n,), dtype=np.float64)
+    padded_var_all = np.zeros((n,), dtype=np.float64)
     gt_list: List[np.ndarray] = [np.zeros((1,), dtype=np.float32) for _ in range(n)]
     rec_list: List[np.ndarray] = [np.zeros((1,), dtype=np.float32) for _ in range(n)]
 
-    use_reversible_norm = bool(getattr(h, "use_reversible_norm", True))
+    infer_cfg = getattr(h, "inference", {}) or {}
+    padding_mode = str(infer_cfg.get("padding_mode", "constant")).strip().lower()
+    preserve_prepad_stats = _parse_bool(
+        infer_cfg.get("preserve_prepad_stats", False),
+        "preserve_prepad_stats",
+    )
+    downsample_factor = _downsample_factor(h)
 
     with torch.no_grad():
         for batch in loader:
-            x = batch["x"].to(device, non_blocking=True)
             sample_indices = batch["sample_index"].numpy()
             offsets = batch["offset"].numpy()
             lengths = batch["length"].numpy()
 
-            if use_reversible_norm:
-                x_in, mu, std = input_norm(x)
-            else:
-                x_in, mu, std = x, None, None
-
-            latent = encoder(x_in)
-            zq = quantizer(latent).z_q if quantizer is not None else latent
-            x_hat_norm = decoder(zq)
-            x_hat = inverse_revin(input_norm, x_hat_norm, mu, std) if use_reversible_norm else x_hat_norm
-
-            tmin = min(x.shape[-1], x_hat.shape[-1])
-            x_ref = x[:, 0, :tmin].detach().cpu().numpy()
-            x_rec = x_hat[:, 0, :tmin].detach().cpu().numpy()
-
             for i, sample_idx in enumerate(sample_indices.tolist()):
-                sample_len = int(lengths[i])
-                valid_len = max(1, min(sample_len if sample_len > 0 else tmin, tmin))
+                x_np = batch["x"][i, 0].detach().cpu().numpy().astype(np.float32, copy=True)
+                raw_len = int(x_np.shape[0])
+                padded_np, _, gamma, beta = _pad_to_multiple(
+                    x_np,
+                    downsample_factor,
+                    padding_mode,
+                    preserve_prepad_stats=preserve_prepad_stats,
+                )
+                x = torch.from_numpy(padded_np).view(1, 1, -1).to(device)
 
-                diff = x_rec[i, :valid_len] - x_ref[i, :valid_len]
+                x_in, mu, std = input_norm(x)
+
+                latent = encoder(x_in)
+                zq = quantizer(latent).z_q if quantizer is not None else latent
+                x_hat_norm = decoder(zq)
+                x_hat = inverse_revin(input_norm, x_hat_norm, mu, std)
+
+                rec_full = x_hat[0, 0].detach().cpu().numpy().astype(np.float32, copy=True)
+                rec = rec_full[:raw_len].copy()
+                sample_len = int(lengths[i])
+                valid_len = max(1, min(sample_len if sample_len > 0 else raw_len, raw_len, rec.shape[0]))
+
+                diff = rec[:valid_len] - x_np[:valid_len]
                 mae = float(np.mean(np.abs(diff)))
                 mse = float(np.mean(np.square(diff)))
 
-                gt_list[sample_idx] = x_ref[i].copy()
-                rec_list[sample_idx] = x_rec[i].copy()
+                gt_list[sample_idx] = x_np.copy()
+                rec_list[sample_idx] = rec
                 mae_all[sample_idx] = mae
                 mse_all[sample_idx] = mse
                 lengths_all[sample_idx] = sample_len
                 offsets_all[sample_idx] = int(offsets[i])
                 valid_len_all[sample_idx] = valid_len
+                padding_gamma_all[sample_idx] = float(gamma)
+                padding_beta_all[sample_idx] = float(beta)
+                original_mean_all[sample_idx] = float(np.mean(x_np))
+                original_var_all[sample_idx] = float(np.var(x_np))
+                padded_mean_all[sample_idx] = float(np.mean(padded_np))
+                padded_var_all[sample_idx] = float(np.var(padded_np))
 
     subset_npz = os.path.join(recon_dir, f"{subset_name}.npz")
     np.savez_compressed(
@@ -315,6 +429,12 @@ def _infer_one_subset(
         offset=offsets_all,
         length=lengths_all,
         valid_length=valid_len_all,
+        padding_gamma=padding_gamma_all,
+        padding_beta=padding_beta_all,
+        original_mean=original_mean_all,
+        original_var=original_var_all,
+        padded_mean=padded_mean_all,
+        padded_var=padded_var_all,
         subset_root=np.array([subset_root]),
     )
 
@@ -349,6 +469,9 @@ def _infer_one_subset(
         "subset_name": subset_name,
         "subset_root": subset_root,
         "num_samples": int(n),
+        "padding_mode": padding_mode,
+        "preserve_prepad_stats": preserve_prepad_stats,
+        "downsample_factor": downsample_factor,
         "mae": float(np.mean(mae_all)),
         "mse": float(np.mean(mse_all)),
         "npz_path": subset_npz,
