@@ -266,10 +266,6 @@ def _build_models(h, device: torch.device):
     input_norm = ReversibleInstanceNorm1D(
         num_channels=int(h.input_channels),
         eps=float(h.revin_eps),
-        affine=bool(h.revin_affine),
-        init_gamma=float(h.revin_init_gamma),
-        init_beta=float(h.revin_init_beta),
-        positive_gamma=bool(h.revin_positive_gamma),
     ).to(device)
     return encoder, quantizer, decoder, input_norm
 
