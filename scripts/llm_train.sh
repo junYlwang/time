@@ -13,13 +13,13 @@ rjob submit \
   --mount=gpfs://gpfs1/brainllm-share:/mnt/shared-storage-user/brainllm-share \
   --mount=gpfs://gpfs2/speechllm-share:/mnt/shared-storage-gpfs2/speechllm-share \
   --mount=gpfs://gpfs2/brainllm2-share:/mnt/shared-storage-gpfs2/brainllm2-share \
-  --image=registry.h.pjlab.org.cn/ailab-brainllm-brainllm_gpu/junyi-workspace:wangjunyi-20260507140319 \
+  --image=registry.h.pjlab.org.cn/ailab-brainllm-brainllm_gpu/junyi-workspace:wangjunyi-20260528203259 \
   --host-network=false \
   -- bash -exc '
 set -ex
 . /root/miniconda3/etc/profile.d/conda.sh
 cd /mnt/shared-storage-user/wangjunyi
 conda activate codec
-torchrun --nproc_per_node=2 /mnt/shared-storage-user/wangjunyi/time/tools/train_ett_llm_lora.py \
---config /mnt/shared-storage-user/wangjunyi/time/configs/ett-llm-lora-qwen3-4b.yaml \
+torchrun --nproc_per_node=2 /mnt/shared-storage-user/wangjunyi/time/tools/llm_train.py \
+--config /mnt/shared-storage-user/wangjunyi/time/configs/llm-train.yaml \
 '
