@@ -105,3 +105,9 @@ old_configs/
 # checkpoints
 # =========================
 checkpoint/
+
+# =========================
+# markdown
+# =========================
+AGENTS.md
+CLAUDE.md
