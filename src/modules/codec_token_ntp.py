@@ -4,6 +4,15 @@ import torch
 import torch.nn as nn
 
 
+def _compute_valid_token_counts(valid_lengths, downsample_factor, num_quantizers, total_tokens):
+    num_latent_steps = total_tokens // num_quantizers
+    num_valid_latent = torch.ceil(valid_lengths.float() / downsample_factor).long()
+    num_valid_latent = num_valid_latent.clamp(max=num_latent_steps)
+    num_valid_tokens = num_valid_latent * num_quantizers
+    num_pad_tokens = total_tokens - num_valid_tokens
+    return num_valid_tokens, num_pad_tokens
+
+
 class CodecTokenNTPModel(nn.Module):
     def __init__(
         self,
@@ -68,10 +77,19 @@ class CodecTokenNTPModel(nn.Module):
             raise RuntimeError("Codec token id exceeds reserved time-series token vocabulary")
         return self.token_id_lookup[token_nums]
 
-    def forward(self, raw_values: torch.Tensor, valid_lengths: torch.Tensor, **kwargs):
+    def forward(self, raw_values: torch.Tensor, valid_lengths: torch.Tensor, return_loss: bool = True, **kwargs):
         raw_values = raw_values.float()
         valid_lengths = valid_lengths.long()
-        input_ids = self.encode_batch(raw_values, valid_lengths)
-        attention_mask = torch.ones_like(input_ids)
+        input_ids = self.encode_batch(raw_values, valid_lengths)  # [B, T]
+        T = input_ids.size(-1)
+        n_valid, n_pad = _compute_valid_token_counts(
+            valid_lengths, self.downsample_factor, self.num_quantizers, T,
+        )
+
+        # Keep all codec tokens. Padding-derived tokens are placeholders only.
         labels = input_ids.clone()
+        pos = torch.arange(T, device=input_ids.device).unsqueeze(0)  # [1, T]
+        labels[pos < (n_pad + 1).unsqueeze(1)] = -100
+        attention_mask = torch.ones_like(input_ids)
+        attention_mask[pos < n_pad.unsqueeze(1)] = 0
         return self.llm(input_ids=input_ids, attention_mask=attention_mask, labels=labels)

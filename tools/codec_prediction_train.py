@@ -163,6 +163,7 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
         max_valid_sequences=int(h.max_valid_sequences),
         seed=int(h.seed),
         return_valid_length=True,
+        min_input_length=int(h.min_input_length),
     )
     if world_size > 1 and dist.is_initialized():
         train_sampler = DistributedSampler(
@@ -194,6 +195,7 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
         max_valid_sequences=h.max_valid_sequences,
         seed=int(h.seed),
         return_valid_length=True,
+        min_input_length=int(h.min_input_length),
     )
     if world_size > 1 and dist.is_initialized():
         eval_sampler = DistributedSampler(
@@ -226,33 +228,12 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
     codebook_sizes = tuple(getattr(quantizer_for_cov, "codebook_sizes", ()))
     coverage_masks = _init_coverage_masks(codebook_sizes, device)
 
-    steps_per_epoch = max(1, len(train_loader))
-    current_epoch = steps // steps_per_epoch
-    trainset.set_epoch(current_epoch)
-    if train_sampler is not None:
-        train_sampler.set_epoch(current_epoch)
     train_iter = iter(train_loader)
-    steps_in_epoch = steps % steps_per_epoch
-    if steps_in_epoch > 0 and bool(h.resume_skip_seen_batches):
-        for _ in range(steps_in_epoch):
-            try:
-                next(train_iter)
-            except StopIteration:
-                current_epoch += 1
-                trainset.set_epoch(current_epoch)
-                if train_sampler is not None:
-                    train_sampler.set_epoch(current_epoch)
-                train_iter = iter(train_loader)
-                break
 
     while steps < total_steps:
         try:
             x = next(train_iter)
         except StopIteration:
-            current_epoch += 1
-            trainset.set_epoch(current_epoch)
-            if train_sampler is not None:
-                train_sampler.set_epoch(current_epoch)
             train_iter = iter(train_loader)
             x = next(train_iter)
 

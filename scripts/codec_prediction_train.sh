@@ -1,9 +1,9 @@
 GPU=4
 CPU=$((GPU * 8))
 MEMORY=$((GPU * 80000))
-rjob delete pad-ts-codec
+rjob delete ts-codec-512
 rjob submit \
-  --name=pad-ts-codec \
+  --name=pad-ts-codec-512 \
   --gpu=$GPU \
   --cpu=$CPU \
   --memory=$MEMORY \

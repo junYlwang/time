@@ -26,7 +26,8 @@ from datasets.time_moe_dataset import TimeMoEDataset
 from modules.decoder import Decoder
 from modules.encoder_wo_quantize import Encoder
 from modules.quantizer import build_quantizer
-from modules.utils import build_input_norm, inverse_revin, load_checkpoint, load_hparams, set_seed
+from modules.revin import ReversibleInstanceNorm1D
+from modules.utils import load_checkpoint, load_hparams, set_seed
 
 
 @dataclass
@@ -34,13 +35,6 @@ class SampleMeta:
     sample_index: int
     offset: int
     length: int
-
-def _set_quantizer_eval_mode(quantizer) -> None:
-    if quantizer is None:
-        return
-    q = quantizer.module if hasattr(quantizer, "module") else quantizer
-    if hasattr(q, "set_stochastic_mode"):
-        q.set_stochastic_mode(stochastic=False, temperature=0.3)
 
 
 def _normalize_split_name(split: str) -> str:
@@ -114,86 +108,36 @@ def _downsample_factor(h) -> int:
     return factor
 
 
-def _parse_bool(value, name: str) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        normalized = value.strip().lower()
-        if normalized in {"true", "1", "yes", "y"}:
-            return True
-        if normalized in {"false", "0", "no", "n"}:
-            return False
-    raise ValueError(f"{name} must be a bool, got {value!r}")
 
-
-def _pad_to_multiple(
-    x: np.ndarray,
-    multiple: int,
-    padding_mode: str,
-    preserve_prepad_stats: bool,
-) -> Tuple[np.ndarray, int, float, float]:
+def _left_pad_to_multiple(x: np.ndarray, multiple: int) -> Tuple[np.ndarray, int]:
     if multiple <= 0:
         raise ValueError(f"padding multiple must be positive, got {multiple}")
     x = x.astype(np.float32, copy=False)
     pad_len = (-int(x.shape[0])) % multiple
     if pad_len == 0:
-        return x, 0, 1.0, 0.0
+        return x, 0
+    padded = np.pad(x, (pad_len, 0), mode="constant", constant_values=0.0)
+    return padded.astype(np.float32, copy=False), pad_len
 
-    mode = str(padding_mode).strip().lower()
-    if mode == "zero":
-        pad = np.zeros((pad_len,), dtype=np.float32)
-    elif mode == "constant":
-        pad = np.full((pad_len,), float(x[-1]), dtype=np.float32)
-    elif mode == "reflect":
-        if x.shape[0] == 1:
-            pad = np.full((pad_len,), float(x[-1]), dtype=np.float32)
-        else:
-            pad = np.pad(x, (0, pad_len), mode="reflect")[-pad_len:].astype(np.float32, copy=False)
-    else:
-        raise ValueError(
-            f"Unsupported padding_mode: {padding_mode}. Expected one of: zero, constant, reflect"
-        )
 
-    gamma = 1.0
-    beta = 0.0
-    if preserve_prepad_stats:
-        original_mean = float(np.mean(x))
-        original_var = float(np.var(x))
-        pad_mean = float(np.mean(pad))
-        pad_var = float(np.var(pad))
-        eps = 1.0e-12
-        if original_var <= eps:
-            gamma = 0.0
-            beta = original_mean
-            pad = np.full((pad_len,), original_mean, dtype=np.float32)
-        elif mode == "zero":
-            gamma = 0.0
-            beta = original_mean
-            pad = np.full((pad_len,), original_mean, dtype=np.float32)
-        elif mode == "constant":
-            signs = np.where(np.arange(pad_len) % 2 == 0, 1.0, -1.0).astype(np.float64)
-            sign_mean = float(np.mean(signs))
-            centered_energy = float(np.sum((signs - sign_mean) ** 2))
-            if centered_energy <= eps:
-                gamma = 0.0
-                beta = original_mean
-                pad = np.full((pad_len,), original_mean, dtype=np.float32)
-            else:
-                amplitude = float(np.sqrt((pad_len * original_var) / centered_energy))
-                center = float(original_mean - amplitude * sign_mean)
-                gamma = amplitude
-                beta = center
-                pad = (center + amplitude * signs).astype(np.float32, copy=False)
-        elif pad_len == 1 or pad_var <= eps:
-            gamma = 0.0
-            beta = original_mean
-            pad = np.full((pad_len,), original_mean, dtype=np.float32)
-        else:
-            gamma = float(np.sqrt(original_var / pad_var))
-            beta = float(original_mean - gamma * pad_mean)
-            pad = (gamma * pad + beta).astype(np.float32, copy=False)
-
-    return np.concatenate([x, pad], axis=0), pad_len, gamma, beta
+def _masked_zscore_left_padded(
+    x: torch.Tensor,
+    valid_length: int,
+    eps: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if x.ndim != 3:
+        raise ValueError(f"Expected [B, C, T], got shape={tuple(x.shape)}")
+    time_steps = x.size(-1)
+    valid_length = int(max(1, min(int(valid_length), time_steps)))
+    pos = torch.arange(time_steps, device=x.device).view(1, 1, time_steps)
+    valid_mask = pos >= (time_steps - valid_length)
+    weight = valid_mask.to(dtype=x.dtype)
+    count = weight.sum(dim=-1, keepdim=True).clamp_min(1.0)
+    mean = (x * weight).sum(dim=-1, keepdim=True) / count
+    var = ((x - mean).square() * weight).sum(dim=-1, keepdim=True) / count
+    std = torch.sqrt(var + float(eps))
+    x_in = torch.where(valid_mask, (x - mean) / std, torch.zeros_like(x))
+    return x_in, mean, std
 
 
 class SingleSubsetInferenceDataset(Dataset):
@@ -269,7 +213,10 @@ def _build_models(h, device: torch.device):
     encoder = Encoder(h).to(device)
     quantizer = build_quantizer(h).to(device)
     decoder = Decoder(h).to(device)
-    input_norm = build_input_norm(h, device)
+    input_norm = ReversibleInstanceNorm1D(
+        num_channels=int(h.input_channels),
+        eps=float(h.revin_eps),
+    ).to(device)
     return encoder, quantizer, decoder, input_norm
 
 
@@ -305,7 +252,6 @@ def _load_codec_checkpoint(h, device: torch.device):
         quantizer.eval()
     decoder.eval()
     input_norm.eval()
-    _set_quantizer_eval_mode(quantizer)
 
     return encoder, quantizer, decoder, input_norm, checkpoint_path
 
@@ -374,23 +320,16 @@ def _infer_window(
     decoder,
     input_norm,
     downsample_factor: int,
-    padding_mode: str,
-    preserve_prepad_stats: bool,
-    use_reversible_norm: bool,
 ) -> Tuple[np.ndarray, np.ndarray]:
     raw_len = int(window.shape[0])
-    padded_np, _, _, _ = _pad_to_multiple(
-        window,
-        downsample_factor,
-        padding_mode,
-        preserve_prepad_stats=preserve_prepad_stats,
-    )
+    padded_np, pad_len = _left_pad_to_multiple(window, downsample_factor)
     x = torch.from_numpy(padded_np).view(1, 1, -1).to(device)
 
-    if use_reversible_norm:
-        x_in, mu, std = input_norm(x)
-    else:
-        x_in, mu, std = x, None, None
+    x_in, mu, std = _masked_zscore_left_padded(
+        x,
+        valid_length=raw_len,
+        eps=float(input_norm.eps),
+    )
 
     latent = encoder(x_in)
     if quantizer is not None:
@@ -401,9 +340,9 @@ def _infer_window(
         zq = latent
         code_flat = np.zeros((0,), dtype=np.int64)
     x_hat_norm = decoder(zq)
-    x_hat = inverse_revin(input_norm, x_hat_norm, mu, std) if use_reversible_norm else x_hat_norm
+    x_hat = input_norm.inverse(x_hat_norm, mu, std)
     rec_full = x_hat[0, 0].detach().cpu().numpy().astype(np.float32, copy=True)
-    return rec_full[:raw_len].copy(), code_flat
+    return rec_full[pad_len:pad_len + raw_len].copy(), code_flat
 
 
 def _infer_one_subset(
@@ -448,13 +387,7 @@ def _infer_one_subset(
     codes_list: List[np.ndarray] = [np.zeros((0,), dtype=np.int64) for _ in range(n)]
 
     infer_cfg = getattr(h, "inference", {}) or {}
-    padding_mode = str(infer_cfg.get("padding_mode", "constant")).strip().lower()
-    preserve_prepad_stats = _parse_bool(
-        infer_cfg.get("preserve_prepad_stats", False),
-        "preserve_prepad_stats",
-    )
     downsample_factor = _downsample_factor(h)
-    use_reversible_norm = bool(getattr(h, "use_reversible_norm", True))
     total_abs_error = 0.0
     total_sq_error = 0.0
     total_points = 0
@@ -482,9 +415,6 @@ def _infer_one_subset(
                         decoder=decoder,
                         input_norm=input_norm,
                         downsample_factor=downsample_factor,
-                        padding_mode=padding_mode,
-                        preserve_prepad_stats=preserve_prepad_stats,
-                        use_reversible_norm=use_reversible_norm,
                     )
                     rec_np[start:end] = rec_window
                     code_parts.append(code_flat)
@@ -565,8 +495,9 @@ def _infer_one_subset(
         "window_length": int(window_length),
         "num_samples": int(n),
         "num_points": int(total_points),
-        "padding_mode": padding_mode,
-        "preserve_prepad_stats": preserve_prepad_stats,
+        "padding_side": "left",
+        "padding_value": 0.0,
+        "normalization": "valid_points_zscore",
         "downsample_factor": downsample_factor,
         "mae": float(mae),
         "mse": float(mse),

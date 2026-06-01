@@ -30,25 +30,22 @@ if _SRC_DIR not in sys.path:
 from modules.decoder import Decoder
 from modules.encoder_wo_quantize import Encoder
 from modules.quantizer import build_quantizer
-from modules.utils import build_input_norm, inverse_revin, load_checkpoint, load_hparams, set_seed
+from modules.revin import ReversibleInstanceNorm1D
+from modules.utils import load_checkpoint, load_hparams, set_seed
 
 
 DEFAULT_GIFT_EVAL_ROOT = '/mnt/shared-storage-gpfs2/speechllm-share/lishenyi/datasets/gift-eval'
 
-
-def _set_quantizer_eval_mode(quantizer) -> None:
-    if quantizer is None:
-        return
-    q = quantizer.module if hasattr(quantizer, 'module') else quantizer
-    if hasattr(q, 'set_stochastic_mode'):
-        q.set_stochastic_mode(stochastic=False, temperature=0.3)
 
 
 def _build_models(h, device: torch.device):
     encoder = Encoder(h).to(device)
     quantizer = build_quantizer(h).to(device)
     decoder = Decoder(h).to(device)
-    input_norm = build_input_norm(h, device)
+    input_norm = ReversibleInstanceNorm1D(
+        num_channels=int(h.input_channels),
+        eps=float(h.revin_eps),
+    ).to(device)
     return encoder, quantizer, decoder, input_norm
 
 
@@ -80,7 +77,6 @@ def _load_codec_checkpoint(h, device: torch.device):
         quantizer.eval()
     decoder.eval()
     input_norm.eval()
-    _set_quantizer_eval_mode(quantizer)
 
     return encoder, quantizer, decoder, input_norm, checkpoint_path
 
@@ -230,8 +226,9 @@ def main() -> None:
     input_lengths = np.zeros((len(samples),), dtype=np.int64)
     original_mean = np.zeros((len(samples),), dtype=np.float64)
     original_var = np.zeros((len(samples),), dtype=np.float64)
-    padded_mean = np.zeros((len(samples),), dtype=np.float64)
-    padded_var = np.zeros((len(samples),), dtype=np.float64)
+    pad_lengths = np.zeros((len(samples),), dtype=np.int64)
+    normalized_mean = np.zeros((len(samples),), dtype=np.float64)
+    normalized_var = np.zeros((len(samples),), dtype=np.float64)
     reconstruction_lengths = np.zeros((len(samples),), dtype=np.int64)
     overlap_lengths = np.zeros((len(samples),), dtype=np.int64)
     mae_all = np.zeros((len(samples),), dtype=np.float64)
@@ -256,7 +253,7 @@ def main() -> None:
             zq = quantizer(latent).z_q if quantizer is not None else latent
             x_hat_norm = decoder(zq)
             rec_norm = x_hat_norm[:, :, pad_len:pad_len + raw_len]
-            x_hat = inverse_revin(input_norm, rec_norm, mu, std)
+            x_hat = input_norm.inverse(rec_norm, mu, std)
 
             rec_np = x_hat[0, 0].detach().cpu().numpy().astype(np.float32, copy=True)
             overlap_len = int(min(raw_len, rec_np.shape[0]))
@@ -267,9 +264,10 @@ def main() -> None:
             input_lengths[sample_idx] = raw_len
             original_mean[sample_idx] = float(np.mean(x_np))
             original_var[sample_idx] = float(np.var(x_np))
-            padded_input = x_in[0, 0].detach().cpu().numpy()
-            padded_mean[sample_idx] = float(np.mean(padded_input))
-            padded_var[sample_idx] = float(np.var(padded_input))
+            normalized_input = x_in[0, 0].detach().cpu().numpy()
+            pad_lengths[sample_idx] = int(pad_len)
+            normalized_mean[sample_idx] = float(np.mean(normalized_input))
+            normalized_var[sample_idx] = float(np.var(normalized_input))
             reconstruction_lengths[sample_idx] = int(rec_np.shape[0])
             overlap_lengths[sample_idx] = overlap_len
             mae_all[sample_idx] = float(np.mean(np.abs(diff)))
@@ -294,8 +292,9 @@ def main() -> None:
         input_length=input_lengths,
         original_mean=original_mean,
         original_var=original_var,
-        padded_mean=padded_mean,
-        padded_var=padded_var,
+        pad_length=pad_lengths,
+        normalized_mean=normalized_mean,
+        normalized_var=normalized_var,
         reconstruction_length=reconstruction_lengths,
         overlap_length=overlap_lengths,
         groundtruth=np.array(inputs, dtype=object),
@@ -313,8 +312,8 @@ def main() -> None:
         'num_visual_samples': num_visual_samples,
         'num_plot_points': num_plot_points,
         'padding_side': 'left',
-        'padding_value_after_norm': 0.0,
-        'normalization_scope': 'real_points_only',
+        'padding_value': 0.0,
+        'normalization': 'valid_points_zscore',
         'downsample_factor': downsample_factor,
         'mae': float(np.mean(mae_all)),
         'mse': float(np.mean(mse_all)),
