@@ -35,7 +35,7 @@ from modules.encoder_wo_quantize import Encoder
 from modules.decoder import Decoder
 from modules.loss import MultiScaleLogMagSTFTLoss
 from modules.revin import ReversibleInstanceNorm1D
-from modules.predictor import CodePredictor, _build_prediction_mask, _prediction_loss_and_accuracy
+from modules.predictor import CodePredictor, _ntp_loss_and_accuracy
 from modules.quantizer import build_quantizer
 from modules.utils import load_hparams, build_env, load_checkpoint, save_checkpoint, get_state_dict, \
     set_seed, update_topk_and_prune, reduce_mean, \
@@ -76,6 +76,7 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
     input_norm = ReversibleInstanceNorm1D(num_channels=int(h.input_channels), eps=float(h.revin_eps)).to(device)
     quantizer_for_cfg = quantizer.module if hasattr(quantizer, "module") else quantizer
     codebook_sizes = tuple(getattr(quantizer_for_cfg, "codebook_sizes", ()))
+    downsample_factor = math.prod(int(x) for x in h.down_ratio)
     predictor = CodePredictor(h, codebook_sizes).to(device)
     stft_loss_fn = MultiScaleLogMagSTFTLoss(win_sizes=h.stft_win_sizes).to(device)
 
@@ -240,22 +241,17 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
         pred_acc = torch.zeros((), device=device)
         pred_acc_layers = [torch.zeros((), device=device) for _ in codebook_sizes]
         if h.prediction_loss_weight > 0.0 or h.prediction_codec_loss_weight > 0.0:
-            pred_mask = _build_prediction_mask(
-                batch_size=z_q.size(0),
-                seq_len=z_q.size(-1),
-                mask_ratio=h.prediction_mask_ratio,
-                random_mask_prob=h.prediction_random_mask_prob,
-                device=device,
-            )
             if h.prediction_loss_weight > 0.0:
-                pred_logits = predictor(z_q.detach(), pred_mask)
-                pred_loss, pred_acc, pred_acc_layers = _prediction_loss_and_accuracy(pred_logits, _codes, pred_mask)
-            if h.prediction_codec_loss_weight > 0.0:
-                pred_codec_logits = predictor(z_q, pred_mask)
-                pred_codec_loss, pred_codec_acc, pred_codec_acc_layers = _prediction_loss_and_accuracy(
-                    pred_codec_logits, _codes, pred_mask
+                pred_logits = predictor(z_q.detach(), valid_lengths, downsample_factor)
+                pred_loss, pred_acc, pred_acc_layers = _ntp_loss_and_accuracy(
+                    pred_logits, _codes, valid_lengths, downsample_factor
                 )
-                
+            if h.prediction_codec_loss_weight > 0.0:
+                pred_codec_logits = predictor(z_q, valid_lengths, downsample_factor)
+                pred_codec_loss, pred_codec_acc, pred_codec_acc_layers = _ntp_loss_and_accuracy(
+                    pred_codec_logits, _codes, valid_lengths, downsample_factor
+                )
+
         x_hat_norm = decoder(z_q)
         tmin = min(x.size(-1), x_hat_norm.size(-1))
         
@@ -378,13 +374,9 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
             eval_smooth_l1_sum = torch.zeros((), device=device)
             eval_diff_sum = torch.zeros((), device=device)
             eval_stft_sum = torch.zeros((), device=device)
-            eval_pred_random_loss_sum = torch.zeros((), device=device)
-            eval_pred_random_acc_sum = torch.zeros((), device=device)
-            eval_pred_suffix_loss_sum = torch.zeros((), device=device)
-            eval_pred_suffix_acc_sum = torch.zeros((), device=device)
+            eval_pred_ntp_loss_sum = torch.zeros((), device=device)
+            eval_pred_ntp_acc_sum = torch.zeros((), device=device)
             eval_n = torch.zeros((), device=device)
-            eval_random_generator = torch.Generator(device=device)
-            eval_random_generator.manual_seed(int(steps))
 
             with torch.no_grad():
                 for xb in eval_loader:
@@ -396,36 +388,13 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
                     zq = quant_out_b.z_q
                     codes_b = quant_out_b.codes
                     if h.prediction_loss_weight > 0.0:
-                        random_mask = _build_prediction_mask(
-                            batch_size=zq.size(0),
-                            seq_len=zq.size(-1),
-                            mask_ratio=h.prediction_mask_ratio,
-                            random_mask_prob=h.prediction_random_mask_prob,
-                            device=device,
-                            mode="random",
-                            generator=eval_random_generator,
-                        )
-                        suffix_mask = _build_prediction_mask(
-                            batch_size=zq.size(0),
-                            seq_len=zq.size(-1),
-                            mask_ratio=h.prediction_mask_ratio,
-                            random_mask_prob=h.prediction_random_mask_prob,
-                            device=device,
-                            mode="suffix",
-                        )
-                        random_logits = predictor(zq, random_mask)
-                        suffix_logits = predictor(zq, suffix_mask)
-                        pred_random_loss, pred_random_acc, _ = _prediction_loss_and_accuracy(
-                            random_logits, codes_b, random_mask
-                        )
-                        pred_suffix_loss, pred_suffix_acc, _ = _prediction_loss_and_accuracy(
-                            suffix_logits, codes_b, suffix_mask
+                        pred_ntp_logits = predictor(zq, xb_valid_lengths, downsample_factor)
+                        pred_ntp_loss, pred_ntp_acc, _ = _ntp_loss_and_accuracy(
+                            pred_ntp_logits, codes_b, xb_valid_lengths, downsample_factor
                         )
                     else:
-                        pred_random_loss = torch.zeros((), device=device)
-                        pred_random_acc = torch.zeros((), device=device)
-                        pred_suffix_loss = torch.zeros((), device=device)
-                        pred_suffix_acc = torch.zeros((), device=device)
+                        pred_ntp_loss = torch.zeros((), device=device)
+                        pred_ntp_acc = torch.zeros((), device=device)
                     xr_norm = decoder(zq)
                     tmin = min(xb.size(-1), xr_norm.size(-1))
                     xr_rec = xr_norm[..., :tmin]
@@ -460,10 +429,8 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
                     eval_smooth_l1_sum += smooth_l1
                     eval_diff_sum += diff
                     eval_stft_sum += stft
-                    eval_pred_random_loss_sum += pred_random_loss
-                    eval_pred_random_acc_sum += pred_random_acc
-                    eval_pred_suffix_loss_sum += pred_suffix_loss
-                    eval_pred_suffix_acc_sum += pred_suffix_acc
+                    eval_pred_ntp_loss_sum += pred_ntp_loss
+                    eval_pred_ntp_acc_sum += pred_ntp_acc
                     eval_n += 1.0
 
             if world_size > 1 and dist.is_initialized():
@@ -472,10 +439,8 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
                 dist.all_reduce(eval_smooth_l1_sum, op=dist.ReduceOp.SUM)
                 dist.all_reduce(eval_diff_sum, op=dist.ReduceOp.SUM)
                 dist.all_reduce(eval_stft_sum, op=dist.ReduceOp.SUM)
-                dist.all_reduce(eval_pred_random_loss_sum, op=dist.ReduceOp.SUM)
-                dist.all_reduce(eval_pred_random_acc_sum, op=dist.ReduceOp.SUM)
-                dist.all_reduce(eval_pred_suffix_loss_sum, op=dist.ReduceOp.SUM)
-                dist.all_reduce(eval_pred_suffix_acc_sum, op=dist.ReduceOp.SUM)
+                dist.all_reduce(eval_pred_ntp_loss_sum, op=dist.ReduceOp.SUM)
+                dist.all_reduce(eval_pred_ntp_acc_sum, op=dist.ReduceOp.SUM)
                 dist.all_reduce(eval_n, op=dist.ReduceOp.SUM)
 
             eval_mae = (eval_mae_sum / eval_n.clamp(min=1.0)).item()
@@ -483,10 +448,8 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
             eval_smooth_l1 = (eval_smooth_l1_sum / eval_n.clamp(min=1.0)).item()
             eval_diff = (eval_diff_sum / eval_n.clamp(min=1.0)).item()
             eval_stft = (eval_stft_sum / eval_n.clamp(min=1.0)).item()
-            eval_pred_random_loss = (eval_pred_random_loss_sum / eval_n.clamp(min=1.0)).item()
-            eval_pred_random_acc = (eval_pred_random_acc_sum / eval_n.clamp(min=1.0)).item()
-            eval_pred_suffix_loss = (eval_pred_suffix_loss_sum / eval_n.clamp(min=1.0)).item()
-            eval_pred_suffix_acc = (eval_pred_suffix_acc_sum / eval_n.clamp(min=1.0)).item()
+            eval_pred_ntp_loss = (eval_pred_ntp_loss_sum / eval_n.clamp(min=1.0)).item()
+            eval_pred_ntp_acc = (eval_pred_ntp_acc_sum / eval_n.clamp(min=1.0)).item()
 
             if rank == 0:
                 if sw is not None:
@@ -495,10 +458,8 @@ def train(rank: int, local_rank: int, world_size: int, h, resume_from_checkpoint
                     sw.add_scalar("valid/smooth_l1_loss", eval_smooth_l1, steps)
                     sw.add_scalar("valid/diff_l1_loss", eval_diff, steps)
                     sw.add_scalar("valid/stft_loss", eval_stft, steps)
-                    sw.add_scalar("valid/prediction_loss_random", eval_pred_random_loss, steps)
-                    sw.add_scalar("valid/prediction_loss_suffix", eval_pred_suffix_loss, steps)
-                    sw.add_scalar("valid/prediction_acc_random", eval_pred_random_acc, steps)
-                    sw.add_scalar("valid/prediction_acc_suffix", eval_pred_suffix_acc, steps)
+                    sw.add_scalar("valid/prediction_loss_ntp", eval_pred_ntp_loss, steps)
+                    sw.add_scalar("valid/prediction_acc_ntp", eval_pred_ntp_acc, steps)
 
                 # Checkpoint selection depends only on MAE.
                 score = -eval_mae

@@ -1,9 +1,9 @@
-GPU=2
+GPU=4
 CPU=$((GPU * 8))
 MEMORY=$((GPU * 80000))
-rjob delete 512-codec-prediction-rfsq2-data-v1
+rjob delete codec-fsq-prediction-warmup
 rjob submit \
-  --name=512-codec-prediction-rfsq2-data-v1 \
+  --name=codec-fsq-prediction-warmup \
   --gpu=$GPU \
   --cpu=$CPU \
   --memory=$MEMORY \
@@ -20,6 +20,6 @@ set -ex
 . /root/miniconda3/etc/profile.d/conda.sh
 cd /mnt/shared-storage-user/wangjunyi/time
 conda activate time
-torchrun --nproc_per_node=2 /mnt/shared-storage-user/wangjunyi/time/tools/codec_prediction_pad_train.py \
---config /mnt/shared-storage-user/wangjunyi/time/configs/codec-prediction-rfsq2-data-v1.yaml
+torchrun --nproc_per_node=4 /mnt/shared-storage-user/wangjunyi/time/tools/codec_prediction_train.py \
+--config /mnt/shared-storage-user/wangjunyi/time/configs/codec-prediction-fsq-data-v1.yaml
 '

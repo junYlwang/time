@@ -163,7 +163,12 @@ class TransformerBlock(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.rope = RotaryEmbedding(self.head_dim)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        is_causal: bool = False,
+    ) -> torch.Tensor:
         b, l, d = x.shape
         h = self.norm1(x) #prenorm
         qkv = self.qkv(h).view(b, l, 3, self.nhead, self.head_dim).permute(2, 0, 3, 1, 4)
@@ -171,11 +176,26 @@ class TransformerBlock(nn.Module):
         cos, sin = self.rope(l, x.device, x.dtype)
         q = _apply_rope(q, cos, sin)
         k = _apply_rope(k, cos, sin)
+
+        attn_mask = None
+        sdpa_is_causal = is_causal
+        if attention_mask is not None:
+            valid_keys = attention_mask.to(device=x.device, dtype=torch.bool).view(b, 1, 1, l)
+            allowed = valid_keys.expand(b, 1, l, l)
+            if is_causal:
+                causal = torch.ones(l, l, device=x.device, dtype=torch.bool).tril().view(1, 1, l, l)
+                allowed = allowed & causal
+            eye = torch.eye(l, device=x.device, dtype=torch.bool).view(1, 1, l, l)
+            allowed = allowed | eye
+            attn_mask = torch.zeros(b, 1, l, l, device=x.device, dtype=x.dtype)
+            attn_mask = attn_mask.masked_fill(~allowed, torch.finfo(x.dtype).min)
+            sdpa_is_causal = False
+
         attn = F.scaled_dot_product_attention(
             q, k, v,
-            attn_mask=None,
+            attn_mask=attn_mask,
             dropout_p=self.attn_dropout if self.training else 0.0,
-            is_causal=False,
+            is_causal=sdpa_is_causal,
         )
         attn = attn.transpose(1, 2).contiguous().view(b, l, d)
         x = x + self.dropout(self.proj(attn))
