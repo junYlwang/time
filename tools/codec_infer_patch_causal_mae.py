@@ -23,8 +23,7 @@ if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
 
 from datasets.time_moe_dataset import TimeMoEDataset
-from modules.decoder import Decoder
-from modules.encoder_wo_quantize import Encoder
+from modules.patch_codec import PatchCausalMAEEncoder as Encoder, PatchCausalDecoder as Decoder
 from modules.quantizer import build_quantizer
 from modules.revin import ReversibleInstanceNorm1D
 from modules.utils import load_checkpoint, load_hparams, set_seed
@@ -99,13 +98,7 @@ def _safe_int(v, default: int = -1) -> int:
 
 
 def _downsample_factor(h) -> int:
-    factor = 1
-    for ratio in getattr(h, "down_ratio"):
-        ratio = int(ratio)
-        if ratio <= 0:
-            raise ValueError(f"down_ratio values must be positive, got {getattr(h, 'down_ratio')}")
-        factor *= ratio
-    return factor
+    return int(h.patch_size)
 
 
 
@@ -240,8 +233,8 @@ def _load_codec_checkpoint(h, device: torch.device):
     else:
         quantizer = None
         print(
-            "[Warn] No 'quantizer' found in checkpoint. "
-            "Using no-quantizer inference path for compatibility."
+            "[Info] No 'quantizer' found in checkpoint. "
+            "Using continuous MAE no-quantizer inference path."
         )
     decoder.load_state_dict(state["decoder"], strict=True)
     if "input_norm" in state:
@@ -327,9 +320,10 @@ def _infer_one_subset(
                     eps=float(input_norm.eps),
                 )
 
-                latent = encoder(x_in)
+                valid_lengths = torch.tensor([raw_len], dtype=torch.long, device=device)
+                latent = encoder(x_in, valid_lengths)
                 zq = quantizer(latent).z_q if quantizer is not None else latent
-                x_hat_norm = decoder(zq)
+                x_hat_norm = decoder(zq, valid_lengths)
                 x_hat = input_norm.inverse(x_hat_norm, mu, std)
 
                 rec_full = x_hat[0, 0].detach().cpu().numpy().astype(np.float32, copy=True)
@@ -412,7 +406,7 @@ def _infer_one_subset(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, required=True, help="Path to config YAML")
+    parser.add_argument("--config", type=str, required=True, help="Path to MAE codec config YAML")
     args = parser.parse_args()
 
     h = load_hparams(args.config)

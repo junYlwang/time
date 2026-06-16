@@ -6,6 +6,7 @@ import yaml
 import matplotlib
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch.nn.utils import weight_norm
 matplotlib.use("Agg")
 import matplotlib.pylab as plt
@@ -195,3 +196,41 @@ def update_topk_and_prune(ckpt_dir: str, keep_k: int, score: float, steps: int):
 
     _save_topk(record_path, records)
     return records
+
+
+def valid_mask_from_lengths(valid_lengths: torch.Tensor, time_steps: int, device: torch.device) -> torch.Tensor:
+    valid_lengths = valid_lengths.to(device=device, dtype=torch.long).clamp(min=0, max=time_steps)
+    positions = torch.arange(time_steps, device=device).view(1, 1, time_steps)
+    starts = time_steps - valid_lengths.view(-1, 1, 1)
+    return positions >= starts
+
+
+def masked_input_norm(input_norm, x: torch.Tensor, valid_lengths: torch.Tensor):
+    if x.ndim != 3:
+        raise ValueError(f"Expected [B, C, T], got shape={tuple(x.shape)}")
+    valid_mask = valid_mask_from_lengths(valid_lengths, x.size(-1), x.device)
+    valid = valid_mask.to(dtype=x.dtype)
+    count = valid.sum(dim=-1, keepdim=True).clamp_min(1.0)
+    mean = (x * valid).sum(dim=-1, keepdim=True) / count
+    var = ((x - mean).square() * valid).sum(dim=-1, keepdim=True) / count
+    std = torch.sqrt(var + float(getattr(input_norm, "eps", 1.0e-5)))
+    y = (x - mean) / std
+    y = torch.where(valid_mask, y, torch.zeros_like(y))
+    return y, mean, std, valid_mask
+
+
+def masked_smooth_l1_loss(x_rec: torch.Tensor, x_ref: torch.Tensor, mask: torch.Tensor, beta: float) -> torch.Tensor:
+    loss = F.smooth_l1_loss(x_rec, x_ref, beta=beta, reduction="none")
+    weight = mask.to(dtype=loss.dtype)
+    return (loss * weight).sum() / weight.sum().clamp_min(1.0)
+
+
+def masked_diff_l1_loss(x_rec: torch.Tensor, x_ref: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    if x_rec.size(-1) <= 1:
+        return torch.zeros((), device=x_rec.device)
+    diff_mask = mask[..., 1:] & mask[..., :-1]
+    if not bool(diff_mask.any()):
+        return torch.zeros((), device=x_rec.device)
+    loss = torch.abs(torch.diff(x_rec, dim=-1) - torch.diff(x_ref, dim=-1))
+    weight = diff_mask.to(dtype=loss.dtype)
+    return (loss * weight).sum() / weight.sum().clamp_min(1.0)

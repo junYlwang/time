@@ -2,7 +2,7 @@
 set -e
 
 GIFT_EVAL_ROOT=${GIFT_EVAL_ROOT:-/mnt/shared-storage-user/wangjunyi/gift-eval}
-RUN_DIR=${RUN_DIR:-/mnt/shared-storage-user/wangjunyi/time/runs/llm-ntp-patch-local/gift-eval}
+RUN_DIR=${RUN_DIR:-/mnt/shared-storage-user/wangjunyi/time/runs/toto-2.0-2.5b-ft/gift-eval}
 NUM_SHARDS=${NUM_SHARDS:-8}
 
 SHARD_DIRS=()

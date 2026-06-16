@@ -55,6 +55,7 @@ logs/
 # =========================
 runs/
 old_runs/
+old_tools/
 outputs/
 results/
 checkpoints/
