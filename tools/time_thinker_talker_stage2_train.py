@@ -49,8 +49,8 @@ def train(h) -> int:
     device = torch.device("cuda", local_rank) if torch.cuda.is_available() else torch.device("cpu")
     set_seed(int(h.seed) + rank)
     make_run_dir(h, rank, world_size)
-    if int(h.history_length) % int(h.patch_size) != 0:
-        raise ValueError("history_length must be divisible by patch_size")
+    if int(h.max_history_length) % int(h.patch_size) != 0:
+        raise ValueError("max_history_length must be divisible by patch_size")
     if int(h.max_prediction_length) % int(h.patch_size) != 0:
         raise ValueError("max_prediction_length must be divisible by patch_size")
 

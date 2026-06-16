@@ -140,7 +140,7 @@ def make_dataset(h, split: str):
     return SplitTimeSeriesForecastDataset(
         split_manifest_path=str(h.split_manifest_path),
         split=split,
-        history_length=int(h.history_length),
+        max_history_length=int(h.max_history_length),
         max_prediction_length=int(h.max_prediction_length),
         prediction_length_choices=list(h.prediction_length_choices),
         patch_size=int(h.patch_size),
@@ -162,7 +162,7 @@ def forward_batch(batch, encoder, quantizer, projector, thinker, talker, mtp, in
     token_mask = torch.arange(max_future_patches, device=device).view(1, -1) < future_token_lengths.view(-1, 1)
 
     history_norm, future_norm, _, _ = normalize_with_history(history, future, input_norm, history_lengths, future_lengths)
-    thinker_mask = patch_mask_from_lengths(history_lengths, int(h.history_length), int(h.patch_size))
+    thinker_mask = patch_mask_from_lengths(history_lengths, int(h.max_history_length), int(h.patch_size))
     with torch.no_grad():
         target_codes = build_target_codes(encoder, quantizer, future_norm)
     history_latent = encoder(history_norm, history_lengths, None)
@@ -181,8 +181,8 @@ def train(h) -> int:
     device = torch.device("cuda", local_rank) if torch.cuda.is_available() else torch.device("cpu")
     set_seed(int(h.seed) + rank)
     make_run_dir(h, rank, world_size)
-    if int(h.history_length) % int(h.patch_size) != 0:
-        raise ValueError("history_length must be divisible by patch_size")
+    if int(h.max_history_length) % int(h.patch_size) != 0:
+        raise ValueError("max_history_length must be divisible by patch_size")
     if int(h.max_prediction_length) % int(h.patch_size) != 0:
         raise ValueError("max_prediction_length must be divisible by patch_size")
 

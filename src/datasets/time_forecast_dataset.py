@@ -11,7 +11,7 @@ class SplitTimeSeriesForecastDataset(SplitTimeSeriesCodecDataset):
         self,
         split_manifest_path: str,
         split: str,
-        history_length: int,
+        max_history_length: int,
         max_prediction_length: int,
         prediction_length_choices,
         patch_size: int,
@@ -21,7 +21,7 @@ class SplitTimeSeriesForecastDataset(SplitTimeSeriesCodecDataset):
         seed: int = 1234,
         sampling_config=None,
     ):
-        self.history_length = int(history_length)
+        self.max_history_length = int(max_history_length)
         self.max_prediction_length = int(max_prediction_length)
         self.patch_size = int(patch_size)
         self.prediction_length_choices = sorted(int(x) for x in prediction_length_choices)
@@ -36,7 +36,7 @@ class SplitTimeSeriesForecastDataset(SplitTimeSeriesCodecDataset):
         super().__init__(
             split_manifest_path=split_manifest_path,
             split=split,
-            segment_length=self.history_length + self.max_prediction_length,
+            segment_length=self.max_history_length + self.max_prediction_length,
             normalization_method=normalization_method,
             samples_per_epoch=samples_per_epoch,
             max_valid_sequences=max_valid_sequences,
@@ -64,7 +64,7 @@ class SplitTimeSeriesForecastDataset(SplitTimeSeriesCodecDataset):
             start = rng.randrange(pred_len, seq_len - pred_len + 1)
         else:
             start = seq_len - pred_len
-        history_start = max(0, start - self.history_length)
+        history_start = max(0, start - self.max_history_length)
         history = seq[history_start:start]
         future = seq[start:start + pred_len]
         history_len = int(history.size)
@@ -72,7 +72,7 @@ class SplitTimeSeriesForecastDataset(SplitTimeSeriesCodecDataset):
         if history_len < pred_len or future_len != pred_len:
             raise RuntimeError("Invalid forecasting window construction")
 
-        history_pad = np.zeros(self.history_length, dtype=np.float32)
+        history_pad = np.zeros(self.max_history_length, dtype=np.float32)
         history_pad[-history_len:] = history.astype(np.float32, copy=False)
         future_pad = np.zeros(self.max_prediction_length, dtype=np.float32)
         future_pad[:future_len] = future.astype(np.float32, copy=False)
